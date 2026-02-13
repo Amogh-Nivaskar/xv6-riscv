@@ -27,7 +27,6 @@ struct cpu {
 };
 
 extern struct cpu cpus[NCPU];
-extern struct proc proc[NPROC];
 
 
 // per-process data for the trap handling code in trampoline.S.
@@ -107,4 +106,6 @@ struct proc {
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
 };
+
+extern struct proc proc[NPROC];
 
