@@ -6,6 +6,7 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "vm.h"
+#include "procinfo.h"
 
 uint64
 sys_exit(void)
@@ -126,4 +127,22 @@ sys_getproccount(void){
   }
 
   return count;
+}
+
+uint64
+sys_getprocinfo(void){
+  uint64 st;
+  struct procinfo pi;
+  struct proc *p;
+  int count = 0;
+
+  argaddr(0, &st);
+  for (p = proc; p < &proc[NPROC]; p++){
+    if (p->state != UNUSED){
+      safestrcpy(pi.names[count], p->name, 16);
+      count++;
+    }
+  } 
+  pi.count = count;
+  return copyout(myproc()->pagetable, st, (char*)&pi, sizeof(pi));
 }
