@@ -134,17 +134,60 @@ static uint64 (*syscalls[])(void) = {
 [SYS_getprocinfo]  sys_getprocinfo,
 };
 
+static char *syscall_name_map[] = {
+  [SYS_fork]         = "fork",
+  [SYS_exit]         = "exit",
+  [SYS_wait]         = "wait",
+  [SYS_pipe]         = "pipe",
+  [SYS_read]         = "read",
+  [SYS_kill]         = "kill",
+  [SYS_exec]         = "exec",
+  [SYS_fstat]        = "fstat",
+  [SYS_chdir]        = "chdir",
+  [SYS_dup]          = "dup",
+  [SYS_getpid]       = "getpid",
+  [SYS_sbrk]         = "sbrk",
+  [SYS_pause]        = "pause",
+  [SYS_uptime]       = "uptime",
+  [SYS_open]         = "open",
+  [SYS_write]        = "write",
+  [SYS_mknod]        = "mknod",
+  [SYS_unlink]       = "unlink",
+  [SYS_link]         = "link",
+  [SYS_mkdir]        = "mkdir",
+  [SYS_close]        = "close",
+  [SYS_hello]        = "hello",
+  [SYS_getproccount] = "getproccount",
+  [SYS_getprocinfo]  = "getprocinfo",
+};
+
+extern uint ticks;
+
 void
 syscall(void)
 {
   int num;
   struct proc *p = myproc();
+  uint approx_time = ticks * 10;
 
   num = p->trapframe->a7;
   if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
     // Use num to lookup the system call function for num, call it,
     // and store its return value in p->trapframe->a0
     p->trapframe->a0 = syscalls[num]();
+
+    char *result;
+    if (p->trapframe->a0 < 0){
+      result = "failure";
+    }else{
+      result = "success";
+    }
+
+    if (syscall_name_map[num]){
+      printf("[SYSCALL: %d | %s] %s\n", approx_time, result, syscall_name_map[num]);
+    }else{
+      printf("[SYSCALL: %d | %s] undefined\n", approx_time, result);
+    }
   } else {
     printf("%d %s: unknown sys call %d\n",
             p->pid, p->name, num);
