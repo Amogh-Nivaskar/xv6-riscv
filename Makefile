@@ -148,6 +148,7 @@ UPROGS=\
 	$U/_helltest\
     $U/_proccnttest\
 	$U/_procinfotest\
+	$U/_settracer\
 
 fs.img: mkfs/mkfs README $(UPROGS)
 	mkfs/mkfs fs.img README $(UPROGS)

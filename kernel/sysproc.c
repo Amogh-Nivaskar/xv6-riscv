@@ -146,3 +146,12 @@ sys_getprocinfo(void){
   pi.count = count;
   return copyout(myproc()->pagetable, st, (char*)&pi, sizeof(pi));
 }
+
+uint64
+sys_settracer(void){
+  extern int tracer_enabled;
+  int value;
+  argint(0, &value);
+  tracer_enabled = value;
+  return 0;
+}

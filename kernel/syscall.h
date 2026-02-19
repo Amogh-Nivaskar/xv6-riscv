@@ -23,3 +23,4 @@
 #define SYS_hello  22
 #define SYS_getproccount  23
 #define SYS_getprocinfo  24
+#define SYS_settracer  25

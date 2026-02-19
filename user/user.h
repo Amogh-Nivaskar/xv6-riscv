@@ -28,6 +28,7 @@ int uptime(void);
 int hello(void);
 int getproccount(void);
 int getprocinfo(struct procinfo*);
+int settracer(int value);
 
 // ulib.c
 int stat(const char*, struct stat*);

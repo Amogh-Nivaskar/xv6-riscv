@@ -45,3 +45,4 @@ entry("uptime");
 entry("hello");
 entry("getproccount");
 entry("getprocinfo");
+entry("settracer");
