@@ -151,6 +151,7 @@ UPROGS=\
 	$U/_settracer\
 	$U/_mlfqtest\
 	$U/_mlfqbench\
+	$U/_sleeptest\
 
 fs.img: mkfs/mkfs README $(UPROGS)
 	mkfs/mkfs fs.img README $(UPROGS)

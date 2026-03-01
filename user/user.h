@@ -29,6 +29,7 @@ int hello(void);
 int getproccount(void);
 int getprocinfo(struct procinfo*);
 int settracer(int value);
+int sleep(int duration);
 
 // ulib.c
 int stat(const char*, struct stat*);

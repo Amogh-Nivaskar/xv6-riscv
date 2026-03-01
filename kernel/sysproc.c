@@ -164,3 +164,18 @@ sys_settracer(void){
   tracer_enabled = value;
   return 0;
 }
+
+uint64 sys_sleep(void){
+  extern uint ticks;
+  int duration;
+  argint(0, &duration);
+  
+  acquire(&tickslock);
+  int start_tick = ticks;
+  while (ticks - start_tick < duration){
+    sleep(&ticks, &tickslock);
+  }
+  release(&tickslock);
+
+  return 0;
+};
