@@ -138,10 +138,19 @@ sys_getprocinfo(void){
 
   argaddr(0, &st);
   for (p = proc; p < &proc[NPROC]; p++){
+    acquire(&p->lock);
     if (p->state != UNUSED){
-      safestrcpy(pi.names[count], p->name, 16);
+      pi.entries[count].pid = p->pid;
+      pi.entries[count].cpu_time = p->cpu_time;
+      pi.entries[count].priority = p->priority;
+      pi.entries[count].state = p->state;
+      pi.entries[count].total_wait_time = p->total_wait_time;
+      pi.entries[count].runs_count = p->runs_count;
+      pi.entries[count].runnable_tick = p->runnable_tick;
+      safestrcpy(pi.entries[count].name, p->name, 16);
       count++;
     }
+    release(&p->lock);
   } 
   pi.count = count;
   return copyout(myproc()->pagetable, st, (char*)&pi, sizeof(pi));

@@ -14,7 +14,7 @@ main(int argc, char* argv[]){
     printf("Process Count: %d\n", pi.count);
 
     for (int i = 0; i < pi.count; i++){
-        printf("%s\n", pi.names[i]);
+        printf("%s\n", pi.entries[i].name);
     }
 
     exit(0);
