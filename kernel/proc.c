@@ -5,6 +5,7 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include <stddef.h>
 
 struct cpu cpus[NCPU];
 
@@ -19,6 +20,8 @@ extern void forkret(void);
 static void freeproc(struct proc *p);
 
 extern char trampoline[]; // trampoline.S
+
+extern uint ticks;
 
 // helps ensure that wakeups of wait()ing
 // parents are not lost. helps obey the
@@ -145,6 +148,11 @@ found:
   memset(&p->context, 0, sizeof(p->context));
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
+  p->cpu_time = 0;
+  p->priority = 0;
+  p->runnable_tick = 0;
+  p->runs_count = 0;
+  p->total_wait_time = 0;
 
   return p;
 }
@@ -227,6 +235,7 @@ userinit(void)
   p->cwd = namei("/");
 
   p->state = RUNNABLE;
+  p->runnable_tick = ticks;
 
   release(&p->lock);
 }
@@ -300,6 +309,7 @@ kfork(void)
 
   acquire(&np->lock);
   np->state = RUNNABLE;
+  np->runnable_tick = ticks;
   release(&np->lock);
 
   return pid;
@@ -425,7 +435,12 @@ void
 scheduler(void)
 {
   struct proc *p;
+  struct proc *chosen_proc = NULL;
   struct cpu *c = mycpu();
+  
+  const int mlfq_allotment[NMLFQ] = {100, 200, 400, 800};
+  uint last_boost_tick = 0;
+  int boost_now = 0;
 
   c->proc = 0;
   for(;;){
@@ -437,28 +452,66 @@ scheduler(void)
     intr_on();
     intr_off();
 
+    if (ticks - last_boost_tick >= MLFQ_BOOST){
+      boost_now = 1;
+    }
+
     int found = 0;
     for(p = proc; p < &proc[NPROC]; p++) {
       acquire(&p->lock);
-      if(p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
+      if (boost_now == 1 && p->state != UNUSED){
+        p->cpu_time = 0;
+        p->priority = 0;
+      }
 
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
+      if (p->state != UNUSED && p->cpu_time >= mlfq_allotment[p->priority]){
+        if (p->priority < NMLFQ-1){
+          p->priority += 1;
+          p->cpu_time = 0;
+        }
+          
+      }
+
+      if(p->state == RUNNABLE &&
+         (chosen_proc == NULL || chosen_proc->priority > p->priority)) {
+        chosen_proc = p; 
         found = 1;
       }
       release(&p->lock);
     }
-    if(found == 0) {
+    
+    if (boost_now == 1){
+      last_boost_tick = ticks;
+      boost_now = 0;
+    }
+
+    if (found == 1) {
+      acquire(&chosen_proc->lock);
+      if (chosen_proc->state == RUNNABLE){
+        // Switch to chosen process.  It is the process's job
+        // to release its lock and then reacquire it
+        // before jumping back to us.
+        chosen_proc->state = RUNNING;
+
+        // Observability calculations
+        int wait_time = ticks - chosen_proc->runnable_tick;
+        chosen_proc->total_wait_time += wait_time;
+        chosen_proc->runs_count += 1;
+
+        c->proc = chosen_proc;
+        swtch(&c->context, &chosen_proc->context);
+
+        // Process is done running for now.
+        // It should have changed its p->state before coming back.
+        c->proc = 0;
+      }
+      release(&chosen_proc->lock);
+      chosen_proc = NULL;
+    }else{
       // nothing to run; stop running on this core until an interrupt.
       asm volatile("wfi");
     }
+
   }
 }
 
@@ -496,6 +549,7 @@ yield(void)
   struct proc *p = myproc();
   acquire(&p->lock);
   p->state = RUNNABLE;
+  p->runnable_tick = ticks;
   sched();
   release(&p->lock);
 }
@@ -580,6 +634,7 @@ wakeup(void *chan)
       acquire(&p->lock);
       if(p->state == SLEEPING && p->chan == chan) {
         p->state = RUNNABLE;
+        p->runnable_tick = ticks;
       }
       release(&p->lock);
     }
@@ -601,6 +656,7 @@ kkill(int pid)
       if(p->state == SLEEPING){
         // Wake process from sleep().
         p->state = RUNNABLE;
+        p->runnable_tick = ticks;
       }
       release(&p->lock);
       return 0;

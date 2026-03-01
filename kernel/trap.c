@@ -61,6 +61,9 @@ usertrap(void)
     // but we want to return to the next instruction.
     p->trapframe->epc += 4;
 
+    // increase cpu_time to avoid gaming of schedular
+    p->cpu_time += 1;
+
     // an interrupt will change sepc, scause, and sstatus,
     // so enable only now that we're done with those registers.
     intr_on();
@@ -81,8 +84,10 @@ usertrap(void)
     kexit(-1);
 
   // give up the CPU if this is a timer interrupt.
-  if(which_dev == 2)
+  if(which_dev == 2){
+    p->cpu_time += 10;
     yield();
+  }
 
   prepare_return();
 

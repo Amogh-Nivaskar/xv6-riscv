@@ -105,6 +105,15 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+
+  // Scheduling fields
+  int priority;                 // current queue level
+  int cpu_time;                 // ticks accumulated at current level
+
+  // Observatory fields
+  int total_wait_time;
+  int runs_count;
+  int runnable_tick;
 };
 
 extern struct proc proc[NPROC];
