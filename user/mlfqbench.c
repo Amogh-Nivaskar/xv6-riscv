@@ -2,6 +2,14 @@
 #include "user/user.h"
 #include "kernel/procinfo.h"
 
+enum loadTypes {CPU, IO};
+
+struct result {
+    int pid;
+    int sched_freq;
+    enum loadTypes load_type;
+};
+
 
 int getprocentry(int pid, struct procinfo* pi, struct procentry* pe){
 
@@ -28,17 +36,21 @@ int
 main(int argc, char *argv[])
 {
   
-    int n_cpu = 8, n_io = 8;
+    int n_cpu = 4, n_io = 4;
+    int pipes[n_cpu + n_io][2];
+
+    printf("Benchmarking MLFQ Schedular...\n");
 
     for (int i=0; i < n_cpu; i++){
+        pipe(pipes[i]);
         if (fork() == 0){
-            int N = 100000000;
+            close(pipes[i][0]);
+
+            int N = 10000000;
             volatile int x = 0;
 
-            for (int i=0; i < 4; i++){
-                for (int round = 0; round < N; round++){
-                    x++;
-                }
+            for (int round = 0; round < N; round++){
+                x++;
             }
 
             struct procentry entry;
@@ -54,23 +66,26 @@ main(int argc, char *argv[])
                 printf("getprocentry() FAILED !!");
 
             int scheduling_freq = entry.runs_count * 100 / uptime();
-            printf("CPU PID: %d | Sched Freq: %d\n", entry.pid, scheduling_freq);
+            struct result r = {
+                .pid = entry.pid,
+                .sched_freq = scheduling_freq,
+                .load_type = CPU
+            };
+            write(pipes[i][1], &r, sizeof(r));
             exit(0);
-
         }
+        close(pipes[i][1]);
     }
     
     for (int i=0; i < n_io; i++){
+        pipe(pipes[n_cpu + i]);
         if (fork() == 0){
-            int N = 100000;
+            close(pipes[n_cpu + i][0]);
 
-            for (int i=0; i < 4; i++){
+            int N = 50;
 
-                for (int round = 0; round < N; round++){
-                    volatile int x = 0;
-                    for(int i = 0; i < 100; i++) x++;  // tiny burst
-                    getpid();
-                }
+            for (int round = 0; round < N; round++){
+                sleep(1);
             }
 
             struct procentry entry;
@@ -86,17 +101,30 @@ main(int argc, char *argv[])
                 printf("getprocentry() FAILED !!");
 
             int scheduling_freq = entry.runs_count * 100 / uptime();
-            printf("I/O PID: %d | Sched Freq: %d\n", entry.pid, scheduling_freq);
+            struct result r = {
+                .pid = entry.pid,
+                .sched_freq = scheduling_freq,
+                .load_type = IO
+            };
+            write(pipes[n_cpu + i][1], &r, sizeof(r));
             exit(0);
-
         }
-    }
-    
-    
-    for (int i=0; i < n_cpu + n_io; i++){
-        wait(0);
+        close(pipes[n_cpu + i][1]);
     }
 
+    struct result r;
+
+    for (int i=0; i < n_cpu + n_io; i++){
+        read(pipes[i][0], &r, sizeof(r));
+        wait(0);
+        char *load;
+        
+        if (r.load_type == CPU)
+            load = "CPU";
+        else
+            load = "I/O";
+        printf("%s PID: %d | Sched Freq: %d\n", load, r.pid, r.sched_freq);
+    }
     exit(0);
 };
 
