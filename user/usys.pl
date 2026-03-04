@@ -47,3 +47,4 @@ entry("getproccount");
 entry("getprocinfo");
 entry("settracer");
 entry("sleep");
+entry("setscheduler")

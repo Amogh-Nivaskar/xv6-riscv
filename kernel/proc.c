@@ -424,40 +424,47 @@ kwait(uint64 addr)
   }
 }
 
-// Per-CPU process scheduler.
-// Each CPU calls scheduler() after setting itself up.
-// Scheduler never returns.  It loops, doing:
-//  - choose a process to run.
-//  - swtch to start running that process.
-//  - eventually that process transfers control
-//    via swtch back to the scheduler.
-void
-scheduler(void)
-{
-  struct proc *p;
-  struct proc *chosen_proc = NULL;
-  struct cpu *c = mycpu();
-  
-  const int mlfq_allotment[NMLFQ] = {100, 200, 400, 800};
-  uint last_boost_tick = 0;
+
+int scheduler_type = MLFQ;
+
+struct sched_state{
+  uint last_boost_tick;
+  struct proc *chosen_proc;
+};
+
+struct sched_state cpu_sched_state[NCPU];
+
+void sched_rr(struct cpu *c){
+
+  for (struct proc *p = proc; p < &proc[NPROC]; p++){
+    acquire(&p->lock);
+    if (p->state == RUNNABLE){
+      p->state = RUNNING;
+      if (p->first_run_tick == -1)
+        p->first_run_tick = ticks;
+      p->runs_count += 1;
+      p->total_wait_time += ticks - p->last_runnable_tick;
+      c->proc = p;
+      swtch(&c->context, &p->context);
+      c->proc = 0;
+    }
+    release(&p->lock);
+  }
+}
+
+
+
+void sched_mlfq(struct cpu *c){
+  struct sched_state *ss = &cpu_sched_state[cpuid()];
+  static const int mlfq_allotment[NMLFQ] = {100, 200, 400, 800};
   int boost_now = 0;
 
-  c->proc = 0;
-  for(;;){
-    // The most recent process to run may have had interrupts
-    // turned off; enable them to avoid a deadlock if all
-    // processes are waiting. Then turn them back off
-    // to avoid a possible race between an interrupt
-    // and wfi.
-    intr_on();
-    intr_off();
-
-    if (ticks - last_boost_tick >= MLFQ_BOOST){
+  if (ticks - ss->last_boost_tick >= MLFQ_BOOST){
       boost_now = 1;
     }
 
     int found = 0;
-    for(p = proc; p < &proc[NPROC]; p++) {
+    for(struct proc *p = proc; p < &proc[NPROC]; p++) {
       acquire(&p->lock);
       if (boost_now == 1 && p->state != UNUSED){
         p->cpu_time = 0;
@@ -473,44 +480,73 @@ scheduler(void)
       }
 
       if(p->state == RUNNABLE &&
-         (chosen_proc == NULL || chosen_proc->priority > p->priority)) {
-        chosen_proc = p; 
+         (ss->chosen_proc == NULL || ss->chosen_proc->priority > p->priority)) {
+        ss->chosen_proc = p; 
         found = 1;
       }
       release(&p->lock);
     }
     
     if (boost_now == 1){
-      last_boost_tick = ticks;
+      ss->last_boost_tick = ticks;
       boost_now = 0;
     }
 
     if (found == 1) {
-      acquire(&chosen_proc->lock);
-      if (chosen_proc->state == RUNNABLE){
+      acquire(&ss->chosen_proc->lock);
+      if (ss->chosen_proc->state == RUNNABLE){
         // Switch to chosen process.  It is the process's job
         // to release its lock and then reacquire it
         // before jumping back to us.
-        chosen_proc->state = RUNNING;
+        ss->chosen_proc->state = RUNNING;
 
         // Observability calculations
-        int wait_time = ticks - chosen_proc->runnable_tick;
-        chosen_proc->total_wait_time += wait_time;
-        chosen_proc->runs_count += 1;
+        if (ss->chosen_proc->first_run_tick == -1)
+          ss->chosen_proc->first_run_tick = ticks;
 
-        c->proc = chosen_proc;
-        swtch(&c->context, &chosen_proc->context);
+        int wait_time = ticks - ss->chosen_proc->last_runnable_tick;
+        ss->chosen_proc->total_wait_time += wait_time;
+        ss->chosen_proc->runs_count += 1;
+
+        c->proc = ss->chosen_proc;
+        swtch(&c->context, &ss->chosen_proc->context);
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.
         c->proc = 0;
       }
-      release(&chosen_proc->lock);
-      chosen_proc = NULL;
+      release(&ss->chosen_proc->lock);
+      ss->chosen_proc = NULL;
     }else{
       // nothing to run; stop running on this core until an interrupt.
       asm volatile("wfi");
     }
+}
+
+// Per-CPU process scheduler.
+// Each CPU calls scheduler() after setting itself up.
+// Scheduler never returns.  It loops, doing:
+//  - choose a process to run.
+//  - swtch to start running that process.
+//  - eventually that process transfers control
+//    via swtch back to the scheduler.
+void (*schedulers[])(struct cpu *) = {sched_rr, sched_mlfq};
+void
+scheduler(void)
+{
+  struct cpu *c = mycpu();
+
+  c->proc = 0;
+  for(;;){
+    // The most recent process to run may have had interrupts
+    // turned off; enable them to avoid a deadlock if all
+    // processes are waiting. Then turn them back off
+    // to avoid a possible race between an interrupt
+    // and wfi.
+    intr_on();
+    intr_off();
+
+    schedulers[scheduler_type](c);
 
   }
 }

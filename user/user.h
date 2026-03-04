@@ -30,6 +30,7 @@ int getproccount(void);
 int getprocinfo(struct procinfo*);
 int settracer(int value);
 int sleep(int duration);
+int setscheduler(int mode);
 
 // ulib.c
 int stat(const char*, struct stat*);

@@ -25,3 +25,4 @@
 #define SYS_getprocinfo  24
 #define SYS_settracer  25
 #define SYS_sleep 26
+#define SYS_setscheduler 27

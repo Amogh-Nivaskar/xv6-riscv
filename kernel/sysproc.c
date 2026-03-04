@@ -179,3 +179,15 @@ uint64 sys_sleep(void){
 
   return 0;
 };
+
+uint64 sys_setscheduler(void){
+  int mode;
+  argint(0, &mode);
+
+  if (mode < 0 || mode >= SCHED_COUNT){
+    return -1;
+  }    
+
+  scheduler_type = mode;
+  return 0;
+}

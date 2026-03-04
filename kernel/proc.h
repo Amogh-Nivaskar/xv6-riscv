@@ -118,3 +118,4 @@ struct proc {
 
 extern struct proc proc[NPROC];
 
+extern int scheduler_type;

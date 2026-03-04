@@ -1,3 +1,5 @@
+#ifndef KERNEL_PARAM_H
+#define KERNEL_PARAM_H
 #define NPROC        64  // maximum number of processes
 #define NCPU          8  // maximum number of CPUs
 #define NOFILE       16  // open files per process
@@ -15,3 +17,5 @@
 #define NMLFQ        4     // number of priority levels
 #define MLFQ_BOOST   500   // ticks between priority boost (~5s)
 
+enum SchedType {RR, MLFQ, SCHED_COUNT};
+#endif

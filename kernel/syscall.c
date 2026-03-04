@@ -106,6 +106,7 @@ extern uint64 sys_getproccount(void);
 extern uint64 sys_getprocinfo(void);
 extern uint64 sys_settracer(void);
 extern uint64 sys_sleep(void);
+extern uint64 sys_setscheduler(void);
 
 // An array mapping syscall numbers from syscall.h
 // to the function that handles the system call.
@@ -136,6 +137,7 @@ static uint64 (*syscalls[])(void) = {
 [SYS_getprocinfo]  sys_getprocinfo,
 [SYS_settracer]  sys_settracer,
 [SYS_sleep]   sys_sleep,
+[SYS_setscheduler] sys_setscheduler,
 };
 
 static char *syscall_name_map[] = {
@@ -163,7 +165,8 @@ static char *syscall_name_map[] = {
   [SYS_hello]        = "hello",
   [SYS_getproccount] = "getproccount",
   [SYS_getprocinfo]  = "getprocinfo",
-  [SYS_settracer]    =  "settracer",
+  [SYS_settracer]    = "settracer",
+  [SYS_setscheduler] = "setscheduler",
 };
 
 extern uint ticks;
