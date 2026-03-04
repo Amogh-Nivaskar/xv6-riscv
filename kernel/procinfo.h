@@ -8,7 +8,10 @@ struct procentry{
     int state;
     int total_wait_time;
     int runs_count;
-    int runnable_tick;
+    int first_runnable_tick;
+    int last_runnable_tick;
+    int first_run_tick;
+    int exit_tick;
 };
 
 struct procinfo {

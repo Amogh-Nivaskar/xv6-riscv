@@ -7,6 +7,7 @@
 #include "proc.h"
 #include "vm.h"
 #include "procinfo.h"
+#include "param.h"
 
 uint64
 sys_exit(void)
@@ -146,7 +147,10 @@ sys_getprocinfo(void){
       pi.entries[count].state = p->state;
       pi.entries[count].total_wait_time = p->total_wait_time;
       pi.entries[count].runs_count = p->runs_count;
-      pi.entries[count].runnable_tick = p->runnable_tick;
+      pi.entries[count].first_runnable_tick = p->first_runnable_tick;
+      pi.entries[count].last_runnable_tick = p->last_runnable_tick;
+      pi.entries[count].first_run_tick = p->first_run_tick;
+      pi.entries[count].exit_tick = p->exit_tick;
       safestrcpy(pi.entries[count].name, p->name, 16);
       count++;
     }

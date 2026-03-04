@@ -150,7 +150,10 @@ found:
   p->context.sp = p->kstack + PGSIZE;
   p->cpu_time = 0;
   p->priority = 0;
-  p->runnable_tick = 0;
+  p->first_runnable_tick = -1;
+  p->last_runnable_tick = -1;
+  p->first_run_tick = -1;
+  p->exit_tick = -1;
   p->runs_count = 0;
   p->total_wait_time = 0;
 
@@ -235,8 +238,8 @@ userinit(void)
   p->cwd = namei("/");
 
   p->state = RUNNABLE;
-  p->runnable_tick = ticks;
-
+  p->first_runnable_tick = ticks;
+  p->last_runnable_tick = ticks;
   release(&p->lock);
 }
 
@@ -309,7 +312,9 @@ kfork(void)
 
   acquire(&np->lock);
   np->state = RUNNABLE;
-  np->runnable_tick = ticks;
+  if (np->first_runnable_tick == -1)
+    np->first_runnable_tick = ticks;
+  np->last_runnable_tick = ticks;
   release(&np->lock);
 
   return pid;
@@ -367,6 +372,8 @@ kexit(int status)
 
   p->xstate = status;
   p->state = ZOMBIE;
+  if (p->exit_tick == -1)
+    p->exit_tick = ticks;
 
   release(&wait_lock);
 
@@ -585,7 +592,7 @@ yield(void)
   struct proc *p = myproc();
   acquire(&p->lock);
   p->state = RUNNABLE;
-  p->runnable_tick = ticks;
+  p->last_runnable_tick = ticks;
   sched();
   release(&p->lock);
 }
@@ -670,7 +677,7 @@ wakeup(void *chan)
       acquire(&p->lock);
       if(p->state == SLEEPING && p->chan == chan) {
         p->state = RUNNABLE;
-        p->runnable_tick = ticks;
+        p->last_runnable_tick = ticks;
       }
       release(&p->lock);
     }
@@ -692,7 +699,7 @@ kkill(int pid)
       if(p->state == SLEEPING){
         // Wake process from sleep().
         p->state = RUNNABLE;
-        p->runnable_tick = ticks;
+        p->last_runnable_tick = ticks;
       }
       release(&p->lock);
       return 0;

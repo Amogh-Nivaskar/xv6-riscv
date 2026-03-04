@@ -113,7 +113,10 @@ struct proc {
   // Observatory fields
   int total_wait_time;
   int runs_count;
-  int runnable_tick;
+  int first_runnable_tick;
+  int last_runnable_tick;
+  int first_run_tick;
+  int exit_tick;
 };
 
 extern struct proc proc[NPROC];
