@@ -29,6 +29,7 @@ main()
     fileinit();      // file table
     virtio_disk_init(); // emulated hard disk
     userinit();      // first user process
+    w_scounteren(7);  // allow user mode access to cycle, time, instret
     __sync_synchronize();
     started = 1;
   } else {
@@ -39,6 +40,7 @@ main()
     kvminithart();    // turn on paging
     trapinithart();   // install kernel trap vector
     plicinithart();   // ask PLIC for device interrupts
+    w_scounteren(7);  // allow user mode access to cycle, time, instret
   }
 
   scheduler();        

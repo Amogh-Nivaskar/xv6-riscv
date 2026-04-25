@@ -1,3 +1,4 @@
+#include "kernel/types.h"
 #define SBRK_ERROR ((char *)-1)
 
 struct stat;
@@ -54,3 +55,10 @@ void printf(const char*, ...) __attribute__ ((format (printf, 1, 2)));
 // umalloc.c
 void* malloc(uint);
 void free(void*);
+
+
+static inline uint64 rdcycle(void) {
+    uint64 x;
+    asm volatile("rdcycle %0" : "=r"(x));
+    return x;
+}

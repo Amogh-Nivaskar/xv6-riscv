@@ -152,6 +152,10 @@ UPROGS=\
 	$U/_mlfqtest\
 	$U/_schedbench\
 	$U/_sleeptest\
+	$U/_cowtest\
+	$U/_forkbench\
+	$U/_noop\
+
 
 fs.img: mkfs/mkfs README $(UPROGS)
 	mkfs/mkfs fs.img README $(UPROGS)
