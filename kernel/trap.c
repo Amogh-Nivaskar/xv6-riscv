@@ -71,7 +71,48 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
-  } else if((r_scause() == 15 || r_scause() == 13) &&
+  }else if (r_scause() == 15){
+    uint64 va = r_stval();
+    va = PGROUNDDOWN(va);
+    pagetable_t pt = p->pagetable;
+    if (va >= MAXVA) {
+      setkilled(p);
+    }else{
+      pte_t *pte = walk(pt, va, 0);
+
+      if (pte == 0 || ((*pte & PTE_V) == 0)){
+        if (vmfault(p->pagetable, va, 0) == 0)
+          setkilled(p);
+      }else if ((*pte & PTE_COW) && (*pte & PTE_U)){
+        uint64 pa = PTE2PA(*pte);
+        int refcnt = getref(pa);
+        if (refcnt == 1){
+          *pte &= ~PTE_COW;
+          *pte |= PTE_W;
+          sfence_vma();
+        }else if (refcnt > 1){
+          char *mem = kalloc();
+          if (mem == 0){
+            setkilled(p);
+          }else {
+            memmove(mem, (char *)pa, PGSIZE);
+            uint flags = PTE_FLAGS(*pte);
+            flags &= ~PTE_COW;
+            flags |= PTE_W;
+            *pte = PA2PTE((uint64)mem) | flags;
+            kfree((void *)pa);
+            sfence_vma();
+          }
+        }else{
+          panic("usertrap: refcnt less than 1");
+        } 
+      }else{
+        if (vmfault(p->pagetable, va, 0) == 0)
+            setkilled(p);
+      }
+    }
+  }
+  else if(r_scause() == 13 &&
             vmfault(p->pagetable, r_stval(), (r_scause() == 13)? 1 : 0) != 0) {
     // page fault on lazily-allocated page
   } else {
