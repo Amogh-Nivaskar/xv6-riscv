@@ -16,6 +16,7 @@
 #define USERSTACK    1     // user stack pages
 #define NMLFQ        4     // number of priority levels
 #define MLFQ_BOOST   500   // ticks between priority boost (~5s)
+#define NVMA         8     // Max segments that ELF files can have
 
 enum SchedType {RR, MLFQ, SCHED_COUNT};
 #endif

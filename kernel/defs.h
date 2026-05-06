@@ -24,6 +24,7 @@ void            consputc(int);
 
 // exec.c
 int             kexec(char*, char**);
+int             flags2perm(int);
 
 // file.c
 struct file*    filealloc(void);

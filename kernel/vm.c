@@ -127,10 +127,13 @@ walkaddr(pagetable_t pagetable, uint64 va)
     return 0;
 
   pte = walk(pagetable, va, 0);
-  if(pte == 0)
-    return 0;
-  if((*pte & PTE_V) == 0)
-    return 0;
+  if(pte == 0 || (*pte & PTE_V) == 0){
+    if (vmfault(pagetable, va, 1) == 0)
+      return 0;
+    pte = walk(pagetable, va, 0);
+    if (pte == 0 || (*pte & PTE_V) == 0)
+      return 0;
+  }
   if((*pte & PTE_U) == 0)
     return 0;
   pa = PTE2PA(*pte);
@@ -444,6 +447,7 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0)
       return -1;
+      
     n = PGSIZE - (srcva - va0);
     if(n > max)
       n = max;
@@ -491,8 +495,53 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
   mem = (uint64) kalloc();
   if(mem == 0)
     return 0;
-  memset((void *) mem, 0, PGSIZE);
-  if (mappages(p->pagetable, va, PGSIZE, mem, PTE_W|PTE_U|PTE_R) != 0) {
+  
+  int vmaIdx = -1;
+
+  for(int i=0; i<NVMA; i++){
+    struct vma v = p->vmas[i];
+    if (va >= v.vaddr && va < v.vaddr + v.memsz){
+      vmaIdx = i;
+      break;
+    }
+  }
+
+  uint flags = 0;
+
+  if (vmaIdx != -1){
+    struct vma v = p->vmas[vmaIdx];
+    uint64 offset = v.off + (va - v.vaddr);
+
+    ilock(v.inode);
+    if (va + PGSIZE < v.vaddr + v.filesz){
+      if(readi(v.inode, 0, (uint64)mem, offset, PGSIZE) != PGSIZE){
+        kfree((void *)mem);
+        iunlock(v.inode);
+        return 0;
+      }
+    }else if(va > v.vaddr + v.filesz && va < v.vaddr + v.memsz){
+      memset((void *) mem, 0, PGSIZE);
+    }else{
+      uint64 textoff = v.off + va - v.vaddr;
+      uint64 textsz = v.vaddr + v.filesz - va;
+      uint64 bsssz = PGSIZE - textsz;
+
+      if(readi(v.inode, 0, (uint64)mem, textoff, textsz) != textsz){
+        kfree((void *)mem);
+        iunlock(v.inode);
+        return 0;
+      }
+      memset((void *) mem+textsz, 0, bsssz);
+    }
+    iunlock(v.inode);
+    flags = flags2perm(v.flags)|PTE_R|PTE_U;
+  }else{
+    memset((void *) mem, 0, PGSIZE);
+    flags = PTE_W|PTE_U|PTE_R;
+  }
+
+  
+  if (mappages(p->pagetable, va, PGSIZE, mem, flags) != 0) {
     kfree((void *)mem);
     return 0;
   }

@@ -82,6 +82,15 @@ struct trapframe {
 
 enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
 
+struct vma {
+  struct inode *inode;
+  uint64 vaddr;
+  uint64 off;
+  uint64 filesz;
+  uint64 memsz;
+  uint32 flags;
+};
+
 // Per-process state
 struct proc {
   struct spinlock lock;
@@ -117,6 +126,8 @@ struct proc {
   int last_runnable_tick;
   int first_run_tick;
   int exit_tick;
+
+  struct vma vmas[NVMA];
 };
 
 extern struct proc proc[NPROC];

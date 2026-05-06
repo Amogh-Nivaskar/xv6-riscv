@@ -180,6 +180,14 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+
+  for (int i=0; i<NVMA; i++){
+    struct vma v = p->vmas[i];
+    if (v.inode != 0){
+      iput(v.inode);
+    }
+  }
+  memset(p->vmas, 0, sizeof(p->vmas));
 }
 
 // Create a user page table for a given process, with no user memory,
@@ -304,6 +312,15 @@ kfork(void)
 
   pid = np->pid;
 
+  memmove(np->vmas, p->vmas, sizeof(p->vmas));
+
+  for (int i=0; i<NVMA; i++){
+    struct vma v = np->vmas[i];
+    if (v.inode != 0){
+      idup(v.inode);
+    }
+  }
+
   release(&np->lock);
 
   acquire(&wait_lock);
@@ -376,7 +393,6 @@ kexit(int status)
     p->exit_tick = ticks;
 
   release(&wait_lock);
-
   // Jump into the scheduler, never to return.
   sched();
   panic("zombie exit");

@@ -7,7 +7,7 @@
 #include "defs.h"
 #include "elf.h"
 
-static int loadseg(pde_t *, uint64, struct inode *, uint, uint);
+// static int loadseg(pde_t *, uint64, struct inode *, uint, uint);
 
 // map ELF permissions to PTE permission bits.
 int flags2perm(int flags)
@@ -33,7 +33,9 @@ kexec(char *path, char **argv)
   struct inode *ip;
   struct proghdr ph;
   pagetable_t pagetable = 0, oldpagetable;
+  struct vma vmas[NVMA] = {0};
   struct proc *p = myproc();
+  int nvma = 0;
 
   begin_op();
 
@@ -54,7 +56,7 @@ kexec(char *path, char **argv)
 
   if((pagetable = proc_pagetable(p)) == 0)
     goto bad;
-
+  
   // Load program into memory.
   for(i=0, off=elf.phoff; i<elf.phnum; i++, off+=sizeof(ph)){
     if(readi(ip, 0, (uint64)&ph, off, sizeof(ph)) != sizeof(ph))
@@ -67,18 +69,26 @@ kexec(char *path, char **argv)
       goto bad;
     if(ph.vaddr % PGSIZE != 0)
       goto bad;
-    uint64 sz1;
-    if((sz1 = uvmalloc(pagetable, sz, ph.vaddr + ph.memsz, flags2perm(ph.flags))) == 0)
+    if(nvma >= NVMA)
       goto bad;
-    sz = sz1;
-    if(loadseg(pagetable, ph.vaddr, ip, ph.off, ph.filesz) < 0)
-      goto bad;
+
+    struct vma v = {
+      .inode = ip,
+      .vaddr = ph.vaddr,
+      .off = ph.off,
+      .filesz = ph.filesz,
+      .memsz = ph.memsz,
+      .flags = ph.flags
+    };
+    vmas[nvma++] = v;
+    idup(ip);
+
+    sz = ph.vaddr + ph.memsz > sz ? ph.vaddr + ph.memsz : sz;
   }
   iunlockput(ip);
   end_op();
   ip = 0;
 
-  p = myproc();
   uint64 oldsz = p->sz;
 
   // Allocate some pages at the next page boundary.
@@ -126,10 +136,18 @@ kexec(char *path, char **argv)
     if(*s == '/')
       last = s+1;
   safestrcpy(p->name, last, sizeof(p->name));
-    
+  
+  for (int j=0; j < NVMA; j++){
+    if (p->vmas[j].inode != 0){
+      iput(p->vmas[j].inode);
+      p->vmas[j].inode = 0;
+    }
+  }
+
   // Commit to the user image.
   oldpagetable = p->pagetable;
   p->pagetable = pagetable;
+  memmove(p->vmas, vmas, sizeof(vmas));
   p->sz = sz;
   p->trapframe->epc = elf.entry;  // initial program counter = ulib.c:start()
   p->trapframe->sp = sp; // initial stack pointer
@@ -141,6 +159,12 @@ kexec(char *path, char **argv)
   if(pagetable)
     proc_freepagetable(pagetable, sz);
   if(ip){
+    for (int j=0; j < NVMA; j++){
+      if (vmas[j].inode != 0){
+        iput(vmas[j].inode);
+        vmas[j].inode = 0;
+      }
+    }
     iunlockput(ip);
     end_op();
   }
@@ -151,23 +175,23 @@ kexec(char *path, char **argv)
 // va must be page-aligned
 // and the pages from va to va+sz must already be mapped.
 // Returns 0 on success, -1 on failure.
-static int
-loadseg(pagetable_t pagetable, uint64 va, struct inode *ip, uint offset, uint sz)
-{
-  uint i, n;
-  uint64 pa;
+// static int
+// loadseg(pagetable_t pagetable, uint64 va, struct inode *ip, uint offset, uint sz)
+// {
+//   uint i, n;
+//   uint64 pa;
 
-  for(i = 0; i < sz; i += PGSIZE){
-    pa = walkaddr(pagetable, va + i);
-    if(pa == 0)
-      panic("loadseg: address should exist");
-    if(sz - i < PGSIZE)
-      n = sz - i;
-    else
-      n = PGSIZE;
-    if(readi(ip, 0, (uint64)pa, offset+i, n) != n)
-      return -1;
-  }
+//   for(i = 0; i < sz; i += PGSIZE){
+//     pa = walkaddr(pagetable, va + i);
+//     if(pa == 0)
+//       panic("loadseg: address should exist");
+//     if(sz - i < PGSIZE)
+//       n = sz - i;
+//     else
+//       n = PGSIZE;
+//     if(readi(ip, 0, (uint64)pa, offset+i, n) != n)
+//       return -1;
+//   }
   
-  return 0;
-}
+//   return 0;
+// }
