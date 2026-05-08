@@ -155,7 +155,11 @@ UPROGS=\
 	$U/_cowtest\
 	$U/_lazyelftest\
 	$U/_forkbench\
+	$U/_execbench\
 	$U/_noop\
+	$U/_noopwait\
+	$U/_fatbin\
+	$U/_fatnoopwait\
 
 
 fs.img: mkfs/mkfs README $(UPROGS)
