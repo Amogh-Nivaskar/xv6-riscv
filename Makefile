@@ -153,6 +153,7 @@ UPROGS=\
 	$U/_schedbench\
 	$U/_sleeptest\
 	$U/_cowtest\
+	$U/_lazyelftest\
 	$U/_forkbench\
 	$U/_noop\
 

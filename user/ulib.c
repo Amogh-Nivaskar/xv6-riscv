@@ -159,3 +159,18 @@ sbrklazy(int n) {
   return sys_sbrk(n, SBRK_LAZY);
 }
 
+int
+countfree(void)
+{
+  int n = 0;
+  uint64 sz0 = (uint64)sbrk(0);
+  while(1){
+    char *a = sbrk(4096);
+    if(a == SBRK_ERROR)
+      break;
+    n++;
+  }
+  sbrk(-((uint64)sbrk(0) - sz0));
+  return n;
+}
+
