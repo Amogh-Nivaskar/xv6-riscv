@@ -23,6 +23,28 @@ if(loadseg(pagetable, ph.vaddr, ip, ph.off, ph.filesz) < 0)
     goto bad;
 ```
 
+For every `PT_LOAD` segment in the ELF, both functions run to completion before `exec()` returns. Here's what that loop is reading for `fatbin`:
+
+```
+ELF file on disk (fatbin)
+
+  +--------------------------------------+
+  |  ELF Header                          |
+  |    entry point, phoff, phnum=2       |
+  +--------------------------------------+
+  |  PH[0]: PT_LOAD  flags=R|X   1 pg    |
+  |  PH[1]: PT_LOAD  flags=R|W   50 pg   |
+  +--------------------------------------+
+  |  text segment              (1 page)  |
+  |    loadseg reads 1 page              |
+  +--------------------------------------+
+  |  data segment            (50 pages)  |
+  |    bigdata[50 x 4096] = {1}          |
+  |    loadseg reads all 50 pages        |
+  |    before the process starts         |
+  +--------------------------------------+
+```
+
 The assumption is that the process needs all of this immediately. `uvmalloc()` allocates physical pages and installs PTEs with `PTE_V=1`. `loadseg()` then walks the page table, finds each physical page, and reads the corresponding file data into it. By the time `exec()` returns, every ELF page is resident in RAM.
 
 This assumption breaks for any program that doesn't use its entire binary. A binary with 50 pages of initialized data loads all 50 pages even if it exits without reading a single byte of that data. Measured: 516M cycles spent in `exec()` for pages that are never accessed. The cost is entirely front-loaded — you pay it before the process is useful.
@@ -50,6 +72,44 @@ struct vma {
 };
 ```
 
+The difference in process state immediately after `exec()`:
+
+```
+After exec() -- Eager:
+
+  page table:
+  +--------------+----------+
+  | text pages   | PTE_V=1  | -> phys  (R|X)
+  +--------------+----------+
+  | data (50 pgs)| PTE_V=1  | -> phys  (R|W)
+  +--------------+----------+
+  | stack        | PTE_V=1  | -> phys
+  +--------------+----------+
+
+  51 physical pages consumed before first instruction
+
+
+After exec() -- Lazy:
+
+  page table:
+  +--------------+----------+
+  | text pages   |  (none)  |
+  +--------------+----------+
+  | data (50 pgs)|  (none)  |
+  +--------------+----------+
+  | stack        | PTE_V=1  | -> phys
+  +--------------+----------+
+
+  1 physical page consumed before first instruction
+
+  proc.vmas[]:
+  +----------------------------------+
+  | [0] ip, vaddr, off,  1pg,  R|X   |
+  | [1] ip, vaddr, off, 50pg,  R|W   |
+  +----------------------------------+
+  Pages faulted in on first access
+```
+
 Each process gets up to `NVMA=8` slots in its `struct proc` — enough for any realistic ELF (text, data, and a few more). The tradeoff accepted: a linear scan of up to 8 entries on every ELF fault to find the owning segment.
 
 **Inode lifetime**
@@ -58,7 +118,31 @@ Each process gets up to `NVMA=8` slots in its `struct proc` — enough for any r
 
 **The boundary page**
 
-ELF binaries have `filesz < memsz` for the data segment — the gap is BSS (zero-initialized). The boundary between `filesz` and `memsz` often falls in the middle of a 4KB page. That page needs the first N bytes read from the file and the remaining 4096−N bytes zeroed. Getting the byte arithmetic wrong produces corrupted BSS — a global variable initialized to zero reads back as garbage on first access. There are three cases to handle per fault, not two.
+ELF binaries have `filesz < memsz` for the data segment — the gap is BSS (zero-initialized). The boundary between `filesz` and `memsz` often falls in the middle of a 4KB page. That page needs the first N bytes read from the file and the remaining 4096−N bytes zeroed. Getting the byte arithmetic wrong produces corrupted BSS — a global variable initialized to zero reads back as garbage on first access. There are three cases to handle per fault, not two:
+
+```
+Segment (data):  vaddr=V, filesz=F, memsz=M   (F < M)
+
+  V              V+F          V+M
+  |               |            |
+  +--------+------+-----+------+
+  | page 0 |    page N  | N+1  |
+  +--------+------+-----+------+
+  |<-- file data (F) -->|<-BSS>|
+                  ^
+            boundary page
+            (part file, part zero)
+
+  Case 1 -- full file page   (va + PGSIZE <= V+F):
+    readi(inode, mem, offset, PGSIZE)
+
+  Case 2 -- boundary page    (va < V+F < va + PGSIZE):
+    readi(inode, mem, offset, textsz)
+    memset(mem + textsz, 0, PGSIZE - textsz)
+
+  Case 3 -- pure BSS page    (va >= V+F):
+    memset(mem, 0, PGSIZE)
+```
 
 **Instruction fetch faults**
 
@@ -134,7 +218,7 @@ Lazy loading is an optimization for programs that don't use their entire binary.
 
 ---
 
-## What I'd Do Differently / What's Next
+## What I'd Do Differently
 
 My first implementation didn't handle the boundary page case — the page where `filesz` cuts through a 4KB boundary. Pure BSS and full-file pages worked. The boundary page returned garbage because I read `PGSIZE` bytes starting at the file offset, but the file only had `textsz` bytes there. BSS variables in the same page came back non-zero. `test_bss()` caught it; I wouldn't have spotted it from inspection.
 
@@ -142,4 +226,3 @@ The fault handler currently holds `ilock()` across the entire disk read. In a mu
 
 The VMA lookup is an O(NVMA) linear scan per fault. With NVMA=8 it's invisible, but the right structure for a larger system is an interval tree keyed on `(vaddr, vaddr + memsz)` — O(log N) lookup regardless of segment count.
 
-Next: swapping. The per-page VMA infrastructure is exactly what eviction needs — a clean mapping from VA back to the file and offset that produced it. The open question is policy: which page do you write back to disk when physical memory is full?
