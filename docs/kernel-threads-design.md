@@ -166,6 +166,8 @@ struct thread_family_shared {
   struct spinlock spinlk;
 
   pagetable_t pagetable;  
+  uint64 sz;
+
   struct file *ofile[NOFILE];
   struct inode *cwd;
   struct vma vmas[NVMA];
@@ -177,7 +179,7 @@ struct thread_family_shared {
 };
 
 ```
-The new `struct thread_family_shared` contains the fields common to a thread family such as the address space via the page table, the list of open files, the inode pointer to the current working directory and the list of VMAs, needed to lazy load the ELF segments of the program.
+The new `struct thread_family_shared` contains the fields common to a thread family such as the address space via the page table, the heap size (i.e. the top of the heap), the list of open files, the inode pointer to the current working directory and the list of VMAs, needed to lazy load the ELF segments of the program.
 
 Each thread in the same family have their `family` pointer pointing to the same `struct thread_family_shared` object.
 
@@ -195,7 +197,7 @@ The `no_clone` boolean flag, basically doesn't allow for a thread to be cloned (
 
 The `tcount` field keeps count of the number of threads alive in this family.
 
-We use a **sleep lock** (`sleeplk`) to protect the shared thread-family state of `ofile`, `cwd` and `vmas`. Operations on shared resources such as the  open file table, current working directory, and VMAs may involve acquiring inode locks, waiting for disk I/O or other actions that can cause the calling thread to sleep. A spin lock is unsuitable here because xv6 disables interrupts while a spinlock is held. If a thread holding a spinlock goes to sleep waiting for an event that depends on an interrupt (such as disk I/O completion), the interrupt cannot be delivered, resulting in a deadlock. A sleep lock avoids this issue by allowing the thread to block and yield the CPU while waiting for the resource to become available.
+We use a **sleep lock** (`sleeplk`) to protect the shared thread-family state of `pagetable`, `ofile`, `cwd` and `vmas`. Operations on shared resources such as the page table, open file table, current working directory, and VMAs may involve acquiring inode locks, waiting for disk I/O or other actions that can cause the calling thread to sleep. A spin lock is unsuitable here because xv6 disables interrupts while a spinlock is held. If a thread holding a spinlock goes to sleep waiting for an event that depends on an interrupt (such as disk I/O completion), the interrupt cannot be delivered, resulting in a deadlock. A sleep lock avoids this issue by allowing the thread to block and yield the CPU while waiting for the resource to become available.
 
 We use a **spin lock** (`spinlk`) to protect the thread count (`tcount`) and user stack tracking array (`ustack_tracking`) as their operations have short critical sections and aren't dependent on interrupts.
 
@@ -264,6 +266,8 @@ MAXVA
 
 In the new memory layout, the thread stacks are allocated from the high end of the user address space and extend downward toward lower virtual addresses. Each thread is assigned a dedicated one-page user stack along with a one-page guard page. The guard page remains unmapped and serves as a protection mechanism against stack overflows. Since stack allocation proceeds downward through the free address space, newly created threads receive stack & guard-page pairs at progressively lower virtual addresses. Each user stack is fixed at one page in size and does not grow dynamically. However, the stack pointer is initialized at the highest address within the stack page and moves downward as stack frames are pushed during execution.
 
+Also now we can also understand how the formula - `ustack_base(i) = MAXVA - (2 * PGSIZE) - (i * 2 * PGSIZE)` - mentioned above was derived. In our notation, `ustack_base` is the **top** of the stack, where the SP starts. Hence, `ustack_base(0) = MAXVA - 2*PGSIZE` is the top of stack #0, which is the boundary shared with the trapframe page above it.  So, to derive the formula, we subtract 2 pages from `MAXVA` for the `Trampoline` and the `Trapframe`. Then we subtract all the stack & guard-page allocations before index `i` and we arrive at the user stack base. The allocation of the user stack is covered in the next section.
+
 The heap starts with one page and grows upward via `sbrk()` while thread stack allocation progresses downward, both regions compete for the same free address space. A naïve allocation strategy would allow thread creation to consume all available free space, potentially preventing future heap growth. To avoid this situation, the design introduces a reservation boundary, `HEAP_RESERVE`, within the free address space. New thread stacks may only be allocated above this boundary, ensuring that a portion of the address space remains available for future heap expansion.
 
 `HEAP_RESERVE` is not a hard limit on heap growth. The boundary only constrains stack allocation. If the heap requires additional pages and free space exists above the reservation boundary, it is permitted to grow beyond `HEAP_RESERVE`. In effect, the reservation acts as a one-way constraint: thread stacks may not cross below the boundary, but the heap may grow beyond it when necessary. The `HEAP_RESERVE` address is stored in the `struct thread_family_shared` in field `heap_reserve`. It is computed in `exec()` using the following formula - 
@@ -277,8 +281,38 @@ This approach provides a simple and predictable balance between thread creation 
 
 
 ### Per-thread User Stack handling with Per-thread User Stack Tracking array 
+The  `clone()` function needs to assign a user stack succesfully to create a new thread. It will call the function whos definition is given below. `t` is the pointer to the calling thread. `base` is the pointer to the ustack's base address, which the function will assign value to if the allocation is succesful. The function will return `0` on success and `-1` on failure.
+```c
+int alloc_ustack(thread *t, uint64 *base)
+```
+The `alloc_ustack()` function will follow these steps:
 
-Now we can also understand how the formula - `ustack_base(i) = MAXVA - (2 * PGSIZE) - (i * 2 * PGSIZE)` - mentioned above was derived. From `MAXVA` we subtract 2 pages for the `Trampoline` and the `Trapframe`. Then we subtract all the stack & guard-page allocations before index `i` and we arrive at the user stack base. The allocation of the user stack will be discussed in the below section.
+1. Get a page of memory by calling `kalloc()`. If it fails, then go to **Step 6**.
+2. Acquire the `spinlk` lock on the `thread_family_shared`. Find an empty stack slot by looping over `ustack_tracking` and finding first index where `ustack_tracking[index] == 0`. Lets call this index `ustack_index`. If such an index is found, mark `ustack_tracking[ustack_index] = 1`. Release the lock. If such an index is not found then go to **Step 6**
+3. Find the `ustack_base` address using the above given formula.
+4. Make sure the ustack & guard-page are not overlapping with the heap and they are above the `heap_reserve`.  
+   ```c
+    ustack_base - 2*PGSIZE > thread_family_shared->sz && ustack_base - 2*PGSIZE > thread_family_shared->heap_reserve
+   ```
+   If this condition is not true, go to **Step 6**
+
+5. Map the stack page to the `ustack_base` address using `mappages()`. Keep the guard page unmapped, so that it can catch any stack overflows. If it fails, go to **Step 6**. Else assign `ustack_base` to `base`. Return `0` for success.
+6. This is the **clean up** step, in case of failure. 
+   1. We need to free the stack page, if allocated. 
+   2. If `mapppages()` succeeded before failure, then we need to unmap the `ustack` page from the page table using `uvmunmap()`
+   3. If the `ustack_index` is marked, then we unmark it as `ustack_tracking[ustack_index] = 0`. 
+   4. Return `-1` for failure.
+
+Also, the user stack needs to be freed on thread exit. For this we follow these steps:
+1. Unmap the stack page from page table, and free the stack page, using `uvmunmap()`
+2. Use the following formula to find the `ustack_index` from the `ustack_base`
+   ```c
+    ustack_index =  (MAXVA - 2*PGSIZE - ustack_base)/(2*PGSIZE)
+   ```
+3. Acquire the spin lock on the thread's `thread_family_shared` struct.
+4. Mark the stack memory region as free as such - `ustack_tracking[ustack_index] = 0`.
+5. Release the lock
+
 
 
 Per thread Kernel Stack handling with Global Kernel Stack Tracking array 
