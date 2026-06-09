@@ -195,7 +195,7 @@ struct thread {
   struct thread *parent;        
 
   uint64 kstack;  
-  uint64 ustack_base;             
+  int slot_index;             
   struct trapframe *trapframe; 
   struct context context;
   
@@ -207,7 +207,7 @@ struct thread {
 ```
 The new `struct thread` contains only the per-thread state required for scheduling, trap handling, and lifecycle management. Unlike the original `struct proc`, it does not contain resources that are shared across all threads in a thread family, such as the address space, open file table, current working directory etc. These shared fields have been moved to a separate shared data structure, to which the `family` field is a pointer to. This is described in more detail in the next section.
 
-`ustack_base` is the address of the base of the thread's user stack, which we will need when freeing the user stack memory. In our notation, the base is where the **Stack Pointer** (`SP`) starts from, i.e. at the top and grows downwards. 
+`slot_index` is the index that this thread has occupied in the `slot_tracking` array (covered in detail in the next subsection). It has an uninitialized value of `-1`.
 
 The structure is protected by a **spin lock** rather than a sleep lock. The scheduler frequently accesses and updates thread state while selecting runnable threads. If contention on the lock caused the scheduler to sleep, scheduling itself could be blocked waiting for access to thread state, creating the possibility of deadlock. Since these operations involve only short in-memory updates, a spin lock is a more appropriate choice.
 
@@ -228,7 +228,7 @@ struct thread_family_shared {
 
   int tcount;
   int no_clone;
-  int ustack_tracking[NFAMILY_THREADS];
+  int slot_tracking[NFAMILY_THREADS];
   uint64 heap_reserve;
 };
 
@@ -239,15 +239,11 @@ The new `struct thread_family_shared` contains the fields common to a thread fam
 
 Each thread in the same family have their `family` pointer pointing to the same `struct thread_family_shared` object.
 
-The `ustack_tracking` array is a boolean array. If `ustack_tracking[i] == 1` then the ustack region at index `i` is occupied, else it is unoccupied. This array is useful when assigning a `ustack` memory region to a new thread. The formula of calculating the base address of a ustack from its index is given below, and is derived from the new **Virtual Memory Layout** explained in detail in the next section.
+The `slot_tracking` array is a boolean array. If `slot_tracking[slot_index] == 1` then the thread slot at index `slot_index` is occupied, else it is unoccupied. This array is useful when assigning a **thread slot** memory region to a new thread. For a given thread's slot index, we can derive formulas for calculating the address of the thread slot's base, the top of the user stack and the base of the trapframe. These formulas are mentioned in the **Virtual Memory Layout** subsection coming up next.
 
 `NFAMILY_THREADS` is the absolute maximum number of threads that you can create in a single thread family. Its limited by the size of the **User Virtual Address Space** as it can accommodate only a limited number of user stacks.
 
 `heap_reserve` is the boundary beyond which user stacks can't be allocated. This will be explained in more detail in the New Memory Layout subsection
-
-```c
-ustack_base(i) = MAXVA - (2 * PGSIZE) - (i * 2 * PGSIZE)
-```
 
 The `no_clone` boolean flag, basically doesn't allow for a thread to be cloned (i.e. another thread to be created) if it is True. We need to turn off cloning especillay when we call `exec()` and kill off all the other family threads, and don't want any new threads created and also in `exit()` when we want to kill all the threads in the family and hence don't want any new threads to be created.
 
@@ -268,7 +264,7 @@ struct tnode {
 
 struct tnode *thead;
 
-struct spinlock tnodeslk;
+struct spinlock tnodes_lock;
 
 ```
 
@@ -278,7 +274,7 @@ The `thread` field is the actual thread represented by this node and `next` is a
 
 The `thead` is the head of the Linked List. For the first thread created, its `tnode` will be attached as the next to `thead`.
 
-`tnodeslk` is a global lock for this list's structure. Hence, when we loop over the list or add or remove nodes, we need to acquire this lock. On the other hand, the per-thread lock in `thread` is used when modifying the thread itself. To avoid deadlocks, you acquire the `tnodeslk` first and then find the thread, then acquire a lock on the thread, release `tnodeslk`, make the changes you want on the thread and then release the lock on the thread.
+`tnodes_lock` is a global lock for this list's structure. Hence, when we loop over the list or add or remove nodes, we need to acquire this lock. On the other hand, the per-thread lock in `thread` is used when modifying the thread itself. To avoid deadlocks, you acquire the `tnodes_lock` first and then find the thread, then acquire a lock on the thread, release `tnodes_lock`, make the changes you want on the thread and then release the lock on the thread.
 
 ### New Memory Layout 
 
@@ -287,20 +283,24 @@ MAXVA
 +-------------------------------+
 |          Trampoline           |  1 page
 +-------------------------------+
-|           Trapframe           |  1 page
+|        Trapframe #0           |  1 page
 +-------------------------------+
 |       User Stack #0 ↓         |  1 page
 +-------------------------------+
 |         Guard Page            |  1 page
 +-------------------------------+
+|        Trapframe #1           |  1 page
++-------------------------------+
 |       User Stack #1 ↓         |  1 page
 +-------------------------------+
 |         Guard Page            |  1 page
 +-------------------------------+
+|        Trapframe #2           |  1 page
++-------------------------------+
 |       User Stack #2 ↓         |  1 page
 +-------------------------------+
 |         Guard Page            |  1 page
-+-------------------------------+  ← Additional stack & guard-page pairs
++-------------------------------+  ← Additional thread slots
 |                               |     may be allocated here
 |         Free Memory           |
 |                               |
@@ -320,9 +320,30 @@ MAXVA
 
 ```
 
-In the new memory layout, the thread stacks are allocated from the high end of the user address space and extend downward toward lower virtual addresses. Each thread is assigned a dedicated one-page user stack along with a one-page guard page. The guard page remains unmapped and serves as a protection mechanism against stack overflows. Since stack allocation proceeds downward through the free address space, newly created threads receive stack & guard-page pairs at progressively lower virtual addresses. Each user stack is fixed at one page in size and does not grow dynamically. However, the stack pointer is initialized at the highest address within the stack page and moves downward as stack frames are pushed during execution.
+In the new memory layout, thread resources are allocated from the high end of the user address space and extend downward toward lower virtual addresses. Each thread is assigned a dedicated **Thread Slot**, which consists of a one-page trapframe, a one-page user stack, and a one-page guard page, as each thread needs its own trapframe for storing user-mode CPU state before a trap and user stack for independent execution:
 
-Also now we can also understand how the formula - `ustack_base(i) = MAXVA - (2 * PGSIZE) - (i * 2 * PGSIZE)` - mentioned above was derived. In our notation, `ustack_base` is the **top** of the stack, where the SP starts. Hence, `ustack_base(0) = MAXVA - 2*PGSIZE` is the top of stack #0, which is the boundary shared with the trapframe page above it.  So, to derive the formula, we subtract 2 pages from `MAXVA` for the `Trampoline` and the `Trapframe`. Then we subtract all the stack & guard-page allocations before index `i` and we arrive at the user stack base. The allocation of the user stack is covered in the next section.
+```text
+    Thread Slot
++------------------+
+|    Trapframe     |
++------------------+
+|    User Stack    |
++------------------+
+|    Guard Page    |
++------------------+
+```
+
+The trapframe stores the complete user register state of the thread during trap handling. The user stack provides the thread's execution stack, while the guard page remains unmapped and serves as a protection mechanism against stack overflows. Since thread slot allocation proceeds downward through the free address space, newly created threads receive thread slots at progressively lower virtual addresses.
+
+Also, now we can derive formulas for calculating the address of the thread slot's base, the top of the user stack and the base of the trapframe, given a thread's slot index.
+
+```c
+slot_base(i)    = MAXVA - 4*PGSIZE - (i * 3 * PGSIZE)
+ustack_top(i)   = slot_base(i) + 2*PGSIZE   // initial SP value
+trapframe_base(i) = slot_base(i) + 2*PGSIZE   // start of trapframe page
+```
+
+In our notation, `slot_base` is the **bottom** of the guard-page, `ustack_top` is the **top** of the user stack  and `trapframe_base` is the **bottom** of the trapframe. `ustack_top` and `trapframe_base` evaluate to the same address. This is the boundary between the stack page and the trapframe page. From the stack's perspective it is the initial SP value; from the trapframe's perspective it is the start of the trapframe page. The allocation of the thread slot is covered in the next section.
 
 The heap starts with one page and grows upward via `sbrk()` while thread stack allocation progresses downward, both regions compete for the same free address space. A naïve allocation strategy would allow thread creation to consume all available free space, potentially preventing future heap growth. To avoid this situation, the design introduces a reservation boundary, `HEAP_RESERVE`, within the free address space. New thread stacks may only be allocated above this boundary, ensuring that a portion of the address space remains available for future heap expansion.
 
@@ -336,38 +357,54 @@ This approach provides a simple and predictable balance between thread creation 
 
 
 
-### Per-thread User Stack handling with Per-thread User Stack Tracking array 
-The  `clone()` function needs to assign a user stack succesfully to create a new thread. It will call the function whos definition is given below. `t` is the pointer to the calling thread. `base` is the pointer to the ustack's base address, which the function will assign value to if the allocation is succesful. The function will return `0` on success and `-1` on failure.
+### Per-thread Slot handling with Per-thread Slot Tracking array 
+The  `clone()` function needs to assign a user stack succesfully to create a new thread. It will call the function whos definition is given below. `family` is the pointer to the family shared struct. `base` is the pointer to the ustack's base address, which the function will assign value to if the allocation is succesful. The function will return `0` on success and `-1` on failure.
 ```c
-int alloc_ustack(thread *t, uint64 *base)
+int alloc_slot(struct thread_family_shared *family, struct thread *td)
 ```
-The `alloc_ustack()` function will follow these steps:
+The `alloc_slot()` function will follow these steps:
 
-1. Get a page of memory by calling `kalloc()`. If it fails, then go to **Step 6**.
-2. Acquire the `spinlk` lock on the `thread_family_shared`. Find an empty stack slot by looping over `ustack_tracking` and finding first index where `ustack_tracking[index] == 0`. Lets call this index `ustack_index`. If such an index is found, mark `ustack_tracking[ustack_index] = 1`. Release the lock. If such an index is not found then go to **Step 6**
-3. Find the `ustack_base` address using the above given formula.
+1. Acquire the `spinlk` lock on the `thread_family_shared`. Find an empty stack slot by looping over `slot_tracking` and finding first index where `slot_tracking[index] == 0`. Lets call this index `slotIdx`. If such an index is found, mark `slot_tracking[slotIdx] = 1`. Release the lock. If such an index is not found then go to **Step 7**
+2. Mark slot index - `td->slot_index = slotIdx;`
+3. Find the `ustack_top` and `trapframe_base` addresses using the above given formula.
 4. Make sure the ustack & guard-page are not overlapping with the heap and they are above the `heap_reserve`.  
    ```c
-    ustack_base - 2*PGSIZE > thread_family_shared->sz && ustack_base - 2*PGSIZE > thread_family_shared->heap_reserve
+    ustack_top - 2*PGSIZE > thread_family_shared->sz && ustack_top - 2*PGSIZE > thread_family_shared->heap_reserve
    ```
-   If this condition is not true, go to **Step 6**
+   If this condition is not true, go to **Step 7**
+5. Allocate the user stack by doing the following:
+   1.  Get a page of memory by calling `kalloc()`. If it fails, then go to **Step 7**.
+   2.  Acquire the sleep lock on `thread_family_shared`
+   3.  Map the page from `ustack_top - PGSIZE` address using `mappages()`. If `mappages()` fails, release the lock and go to **Step 7**.
+   4.  Keep the guard page unmapped, so that it can catch any stack overflows. 
+   5.  Return `0` for success.
+6. Allocate the trapframe by doing the following:
+   1.  Get a page of memory by calling `kalloc()`. If it fails, then go to **Step 7**.
+   2.  Acquire the sleep lock on `thread_family_shared`
+   3.  Map the page from `trapframe_base` address using `mappages()`. If `mappages()` fails, release the lock and go to **Step 7**.
+   4.  Return `0` for success.
+7. This is the **clean up** step, in case of failure. 
+   1. Free the stack page, if allocated. 
+   2. Free the trapframe page, if allocated.
+   3. If user stack `mappages()` succeeded before failure, then we need to acquire the sleep lock on `thread_family_shared` and unmap the `ustack` page from the page table using `uvmunmap()` and then release the lock
+   4. If traprame `mappages()` succeeded before failure, then we need to acquire the sleep lock on `thread_family_shared` and unmap the `trapframe` page from the page table using `uvmunmap()` and then release the lock
+   5. If the `slot_tracking[slotIdx]` is marked, then we acquire the spin lock on `thread_family_shared`, and then we unmark it as `slot_tracking[slotIdx] = 0`.  Now, we release the lock.
+   6. If `td->slot_index` is marked, then we unmark it - `td->slot_index = -1`
+   7. Return `-1` for failure.
 
-5. Acquire the sleep lock on `thread_family_shared` and map the stack page to the `ustack_base` address using `mappages()`. Keep the guard page unmapped, so that it can catch any stack overflows. Release the lock. If `mappages()` fails, go to **Step 6**. Else assign `ustack_base` to `base`. Return `0` for success.
-6. This is the **clean up** step, in case of failure. 
-   1. We need to free the stack page, if allocated. 
-   2. If `mappages()` succeeded before failure, then we need to acquire the sleep lock on `thread_family_shared` and unmap the `ustack` page from the page table using `uvmunmap()` and then release the lock
-   3. If the `ustack_index` is marked, then we acquire the spin lock on `thread_family_shared`, and then we unmark it as `ustack_tracking[ustack_index] = 0`.  Now, we release the lock.
-   4. Return `-1` for failure.
-
-Also, the user stack needs to be freed on thread exit. For this we follow these steps:
-1. Acquire the sleep lock on `thread_family_shared` and unmap the stack page from page table, and free the stack page, using `uvmunmap()`. Release the lock.
-2. Use the following formula to find the `ustack_index` from the `ustack_base`
-   ```c
-    ustack_index(ustack_base) =  (MAXVA - 2*PGSIZE - ustack_base)/(2*PGSIZE)
-   ```
-3. Acquire the spin lock on the thread's `thread_family_shared` struct.
-4. Mark the stack memory region as free as such - `ustack_tracking[ustack_index] = 0`.
-5. Release the lock
+Also, the slot needs to be freed on thread exit.
+```c
+void free_slot(struct thread_family_shared *family, struct thread *td);
+```
+For this we follow these steps:
+1. Acquire the sleep lock on `thread_family_shared` 
+2. Unmap the stack page from page table, and free the stack page, using `uvmunmap()`.
+3. Unmap the trapframe page from page table, and free the stack page, using `uvmunmap()`.
+4. Release the lock.
+5. Acquire the spin lock on the thread's `thread_family_shared` struct.
+6. Mark the stack memory region as free as such - `ustack_tracking[td->slot_index] = 0;`.
+7. Release the lock
+8. Unmark the slot index - `td->slot_index = -1;`.
 
 
 ### Per-thread Kernel Stack handling with Global Kernel Stack Tracking array 
@@ -390,13 +427,12 @@ Also, the formula to find the kstack index from the `kstack_base` is as follows 
 ```c
 kstack_index(kstack_base) =  (MAXVA - PGSIZE - kstack_base)/(2*PGSIZE)
 ```
-The  `clone()` function needs to assign a kernel stack succesfully to create a new thread. It will call the function whos definition is given below. `t` is the pointer to the calling thread. `base` is the pointer to the kstack's base address, which the function will assign value to if the allocation is succesful. The function will return `0` on success and `-1` on failure.
+The  `clone()` function needs to assign a kernel stack succesfully to create a new thread. It will call the function whos definition is given below. `base` is the pointer to the kstack's base address, which the function will assign value to if the allocation is succesful. The function will return `0` on success and `-1` on failure.
 ```c
-int alloc_kstack(thread *t, uint64 *base)
+int alloc_kstack(uint64 *base)
 ```
-The `alloc_kstack()` function will follow these steps:
-
-1. Get a page of memory by calling `kalloc()`. If it fails, then go to **Step 5**.
+To achieve this, we will follow these steps:
+1. Get a page of memory by calling `kalloc()`. If it fails, then go to **Step 5**. 
 2. Acquire the global `kstack_tracking_lock` lock. Find an empty stack slot by looping over `kstack_tracking` and finding first index where `kstack_tracking[index] == 0`. Lets call this index `kstack_index`. If such an index is found, mark `kstack_tracking[kstack_index] = 1`. Release the lock. If such an index is not found then go to **Step 5**
 3. Find the `kstack_base` address using the above given formula.
 4. Acquire the spin lock on `kpgtbl_lock` and map the stack page to the `kstack_base` address using `mappages()`. Keep the guard page unmapped, so that it can catch any stack overflows. Release the lock. If `mappages()` fails, go to **Step 5**. Else assign `kstack_base` to `base`. Return `0` for success.
@@ -406,12 +442,18 @@ The `alloc_kstack()` function will follow these steps:
    3. If the `kstack_index` is marked, then we acquire the spin lock on `kstack_tracking_lock`, and then we unmark it as `kstack_tracking[kstack_index] = 0`.  Now, we release the lock.
    4. Return `-1` for failure.
 
-Also, the kernel stack needs to be freed on thread exit. For this we follow these steps:
-1. Acquire the spin lock on `kpgtbl_lock` and unmap the stack page from page table, and free the stack page, using `uvmunmap()`. Release the lock.
-2. Use the above given formula to find the `kstack_index` from the `kstack_base`
-3. Acquire the spin lock on the `kstack_tracking_lock`.
-4. Mark the stack memory region as free as such - `kstack_tracking[kstack_index] = 0`.
-5. Release the lock
+Also, the kernel stack needs to be freed on thread exit. 
+```c
+void free_kstack(uint64 *base)
+```
+For this we follow these steps:
+1. Acquire the spin lock on `kpgtbl_lock` 
+2. Unmap the stack page from kernel page table, and free the stack page, using `uvmunmap()`. 
+3. Release the lock.
+4. Use the above given formula to find the `kstack_index` from the `kstack_base`
+5. Acquire the spin lock on the `kstack_tracking_lock`.
+6. Mark the stack memory region as free as such - `kstack_tracking[kstack_index] = 0`.
+7. Release the lock
 
 
 ### New allocthread() function
@@ -421,14 +463,40 @@ int allocthread(struct thread *parent);
 ```
 Here `parent` is the pointer to the caller thread. It will be `NULL` if its the first thread of the family.
 
-The `allocthread()` function the following steps - 
+The `allocthread()` function the following steps:
 1. Initialize a new thread object - `struct thread *child;`
-2. if `parent == NULL` i.e. this is the first thread in the family, then we need to initialize the shared family struct by doing the following - 
-   1. Initialize empty shared family object - `struct thread_family_shared *family;`. 
-   2. Initialize empty user page table - `family->pagetable = thread_pagetable(child)`.
-   3. Set thread count to 1 - `family->tcount = 1`
-3. Else if `parent != NULL`, use the shared struct from parent - `struct thread_family_shared *family = &parent->family;`.
-4. 
+2. if `parent == NULL` i.e. this is the first thread in the family, then we need to initialize the shared family struct by doing the following:
+   1. Initialize empty shared family object - `struct thread_family_shared *family;`.
+   2. Allocate page for trapframe =  
+   3. Initialize empty user page table - `family->pagetable = thread_pagetable(child)`.
+   4. Set thread count to 1 - `family->tcount = 1`.
+   5. Zero initialze some family fields - 
+      ```c
+      family->ustack_tracking = {0};
+      family->no_clone = 0;
+      ```
+      [**NOTE:** In case of `parent == NULL`, we don't initialize the rest of the shared family fields as `exec()` is expected to be called before the thread starts executing user code.]
+3. Else if `parent != NULL`, do the following: 
+   1. Use the shared struct from parent - `struct thread_family_shared *family = parent->family;`.
+   2. Increment thread count - `parent->family.tcount += 1`;.
+4. Allocate user stack by calling -  `alloc_ustack(family, child->ustack_base)`.
+5. Allocate kernel stack by calling - `alloc_kstack(family, child->kstack)`.
+6. Initialze the **return address** - `child->context.ra = forkret`.
+7. Create new TCB node - 
+   ```c
+   struct tnode childnode {
+      .thread = child,
+      .next = NULL
+   };
+   ```
+8. Acquire TCB lock, insert new node into first position in TCB List and then release the lock - 
+   ```c
+   aquire(tnodes_lock);
+   struct tnode nxt = thead.next;
+   thead.next = childnode;
+   childnode.next = nxt;
+   release(tnodes_lock);
+   ```
 
 New clone() user space function 
 
