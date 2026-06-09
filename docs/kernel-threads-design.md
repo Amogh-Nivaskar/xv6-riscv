@@ -28,12 +28,12 @@ We also need to add two new userspace APIs:
 - int clone(void (*fn)(void *), void *arg);
 - void thread_exit(void);
 
-clone() creates a new sibling thread from the currently running thread. The caller provides a function pointer indicating where the new thread should begin execution, along with the argument to pass to that function. thread_exit() terminates the calling thread.
+clone() creates a new child thread from the currently running thread. The caller provides a function pointer indicating where the new thread should begin execution, along with the argument to pass to that function. thread_exit() terminates the calling thread.
 
 We also need to modify the behavior of some existing system calls:
 
-- `fork()` should copy only the calling thread into the child process, and not any of its sibling threads.
-- `exec()` should terminate all sibling threads before replacing the calling thread's full thread family with the new program image.
+- `fork()` should copy only the calling thread into the child process, and not any of its other family threads.
+- `exec()` should terminate the rest of the family threads before replacing the calling thread's full thread family with the new program image.
 
 ## Goals
 
@@ -48,7 +48,7 @@ We also need to modify the behavior of some existing system calls:
 5. The shared family struct should be properly protected for concurrent safety.
 6. Threads should exit cleanly, freeing their resources without leaking memory
 7. The Thread Control Block, should be modified to support dynamic creation and destruction of threads, with concurrent safety.
-8. Create new syscall `clone()` to create a new sibling thread.
+8. Create new syscall `clone()` to create a new child thread.
 9. Create new syscall `thread_exit()` to exit the calling thread.
 10. Existing syscalls - `fork()` and `exec()` need to be modified to handle multi-threaded behaviour.
 11. Scheduler should be modfied to safely find thread to run, and change its state, while achieving maximum possible concurrency.
@@ -72,6 +72,60 @@ The PCB is defined as `struct proc[NPROC]`, which is a fixed size array. Meaning
 ### Kernel Stacks
 Each process has its own kernel stack. When a process enters kernel mode (for eg: during a syscall), it switches its SP (stack pointer) from the user stack (ustack) to the kernel stack (kstack).  
 When the kernel boots, the kstacks for all the `NPROC` processes are initialized in the kernel page table. `procinit()` initializes the kstack pointers for all `NPROC` processes using `KSTACK(i)`, which is a fixed formula to compute the kstack address via the process index `i`. The actually kstack allocation for each process is done in  `proc_mapstacks()`, which allocates a page from free-list using `kalloc()` and maps it to kernel page table at the Virtual Address (VA) calculated using `KSTACK(i)`.
+
+### Kernel Virtual Address Space
+
+```text
+MAXVA
++-------------------------------+
+|          Trampoline           |  1 page
++-------------------------------+
+|      Kernel Stack #0 ↓        |  1 page
++-------------------------------+
+|         Guard Page            |  1 page
++-------------------------------+
+|      Kernel Stack #1 ↓        |  1 page
++-------------------------------+
+|         Guard Page            |  1 page
++-------------------------------+
+|              ...              |
++-------------------------------+
+|   Kernel Stack #(NPROC-1) ↓   |  1 page
++-------------------------------+
+|         Guard Page            |  1 page
++-------------------------------+
+|                               |
+|                               |
+|                               |
+|      Unused Virtual Space     |
+|                               |
+|                               |
+|                               |
++-------------------------------+  <-- PHYSTOP
+|                               |
+|         Free Memory           |
+|      (managed by kalloc)      |
+|                               |
++-------------------------------+  <-- end
+|                               |
+|      Kernel Text/Data/BSS     |
+|                               |
++-------------------------------+  <-- KERNBASE
+|             PLIC              |
++-------------------------------+
+|            VIRTIO             |
++-------------------------------+
+|            UART0              |
++-------------------------------+
+0x0000000000000000
+```
+The xv6 kernel maintains a single global page table that is shared by all processes and threads. At the lower end of the virtual address space, device memory regions such as UART0, VIRTIO, and the PLIC are mapped at fixed addresses. Beginning at `KERNBASE`, the kernel establishes an identity mapping of physical memory, where virtual addresses directly correspond to physical addresses.
+The kernel stacks and trampoline page are exceptions and are mapped separately near `MAXVA`.
+
+The region from `KERNBASE` to `end` contains the kernel image, including the kernel's text, data, and BSS sections. The symbol `end` marks the first address immediately following the kernel image. All physical memory between `end` and `PHYSTOP` is initially free and is added to the kernel's page allocator during boot. This region serves as the source of physical pages used throughout the system for user memory, page tables, kernel data structures, and other dynamic allocations.
+
+Near the upper end of the virtual address space, xv6 maps a dedicated kernel stack for each process. Each kernel stack occupies a single page and is protected by an adjacent unmapped guard page that detects stack overflows. Finally, the trampoline page is mapped at the highest virtual address and contains the code used during transitions between user mode and kernel mode.
+
 
 ### Process Context - `struct context`
 Contains the callee-saved registers (s0-s11, ra, sp) that represent a process's kernel execution context. These registers are saved during a context switch and restored when the scheduler switches back to the process, allowing kernel execution to resume from where it left off.
@@ -174,18 +228,20 @@ struct thread_family_shared {
 
   int tcount;
   int no_clone;
-  int ustack_tracking[NTHREAD];
+  int ustack_tracking[NFAMILY_THREADS];
   uint64 heap_reserve;
 };
 
 ```
 The new `struct thread_family_shared` contains the fields common to a thread family such as the address space via the page table, the heap size (i.e. the top of the heap), the list of open files, the inode pointer to the current working directory and the list of VMAs, needed to lazy load the ELF segments of the program.
 
+**NOTE:** The sleep lock should be held wherever any kind of page table access needs to be made. So the existing page table access need to be modified to hold the lock.
+
 Each thread in the same family have their `family` pointer pointing to the same `struct thread_family_shared` object.
 
 The `ustack_tracking` array is a boolean array. If `ustack_tracking[i] == 1` then the ustack region at index `i` is occupied, else it is unoccupied. This array is useful when assigning a `ustack` memory region to a new thread. The formula of calculating the base address of a ustack from its index is given below, and is derived from the new **Virtual Memory Layout** explained in detail in the next section.
 
-`NTHREAD` is the absolute maximum number of threads that you can create in a single thread family. Its limited by the size of the **User Virtual Address Space** as it can accommodate only a limited number of user stacks.
+`NFAMILY_THREADS` is the absolute maximum number of threads that you can create in a single thread family. Its limited by the size of the **User Virtual Address Space** as it can accommodate only a limited number of user stacks.
 
 `heap_reserve` is the boundary beyond which user stacks can't be allocated. This will be explained in more detail in the New Memory Layout subsection
 
@@ -193,7 +249,7 @@ The `ustack_tracking` array is a boolean array. If `ustack_tracking[i] == 1` the
 ustack_base(i) = MAXVA - (2 * PGSIZE) - (i * 2 * PGSIZE)
 ```
 
-The `no_clone` boolean flag, basically doesn't allow for a thread to be cloned (i.e. another thread to be created) if it is True. We need to turn off cloning especillay when we call `exec()` and kill off all the sibling threads, and don't want any new threads created and also in `exit()` when we want to kill all the threads in the family and hence don't want any new threads to be created.
+The `no_clone` boolean flag, basically doesn't allow for a thread to be cloned (i.e. another thread to be created) if it is True. We need to turn off cloning especillay when we call `exec()` and kill off all the other family threads, and don't want any new threads created and also in `exit()` when we want to kill all the threads in the family and hence don't want any new threads to be created.
 
 The `tcount` field keeps count of the number of threads alive in this family.
 
@@ -296,28 +352,83 @@ The `alloc_ustack()` function will follow these steps:
    ```
    If this condition is not true, go to **Step 6**
 
-5. Map the stack page to the `ustack_base` address using `mappages()`. Keep the guard page unmapped, so that it can catch any stack overflows. If it fails, go to **Step 6**. Else assign `ustack_base` to `base`. Return `0` for success.
+5. Acquire the sleep lock on `thread_family_shared` and map the stack page to the `ustack_base` address using `mappages()`. Keep the guard page unmapped, so that it can catch any stack overflows. Release the lock. If `mappages()` fails, go to **Step 6**. Else assign `ustack_base` to `base`. Return `0` for success.
 6. This is the **clean up** step, in case of failure. 
    1. We need to free the stack page, if allocated. 
-   2. If `mapppages()` succeeded before failure, then we need to unmap the `ustack` page from the page table using `uvmunmap()`
-   3. If the `ustack_index` is marked, then we unmark it as `ustack_tracking[ustack_index] = 0`. 
+   2. If `mappages()` succeeded before failure, then we need to acquire the sleep lock on `thread_family_shared` and unmap the `ustack` page from the page table using `uvmunmap()` and then release the lock
+   3. If the `ustack_index` is marked, then we acquire the spin lock on `thread_family_shared`, and then we unmark it as `ustack_tracking[ustack_index] = 0`.  Now, we release the lock.
    4. Return `-1` for failure.
 
 Also, the user stack needs to be freed on thread exit. For this we follow these steps:
-1. Unmap the stack page from page table, and free the stack page, using `uvmunmap()`
+1. Acquire the sleep lock on `thread_family_shared` and unmap the stack page from page table, and free the stack page, using `uvmunmap()`. Release the lock.
 2. Use the following formula to find the `ustack_index` from the `ustack_base`
    ```c
-    ustack_index =  (MAXVA - 2*PGSIZE - ustack_base)/(2*PGSIZE)
+    ustack_index(ustack_base) =  (MAXVA - 2*PGSIZE - ustack_base)/(2*PGSIZE)
    ```
 3. Acquire the spin lock on the thread's `thread_family_shared` struct.
 4. Mark the stack memory region as free as such - `ustack_tracking[ustack_index] = 0`.
 5. Release the lock
 
 
+### Per-thread Kernel Stack handling with Global Kernel Stack Tracking array 
+Unlike earlier where we used to allocate all `NPROC` kernel stacks when the kernel boots up, now we don't allocate any kernel stacks at boot time. When a new thread is being created, we allocate a dedicated kernel stack for it. Other than that, the memory layout doesn't change at all. Here also we run into the same problem of needing to track which stack regions are occupied and which aren't and so here we use a global kernel stack tracking array (`kstack_tracking`) similar to the per-thread user stack tracking array, along with a global lock (`kstack_tracking_lock`) to protect it. We also add a spin lock (`kpgtbl_lock`) to protect the kernel page table. Earlier we didn't need one as after the kernel boot, the kernel page table was essentially read-only. That is not the case now and so we do need a lock to protect it.
+```c
+int kstack_tracking[NTHREADS];
 
-Per thread Kernel Stack handling with Global Kernel Stack Tracking array 
+struct spinlock kstack_tracking_lock;
 
-New allocthread() function
+struct spinlock kpgtbl_lock;
+```
+`NTHREADS` is the absolute maximum number of threads that you can create in the full kernel. Its limited by the size of the **Kernel Virtual Address Space** as it can accommodate only a limited number of kernel stacks.
+
+Since the difference in the user and kernel space memory layout, the formula to find the `kstack_base` is as follows - 
+
+```c
+kstack_base(i) = MAXVA - PGSIZE - (i * 2 * PGSIZE)
+```
+Also, the formula to find the kstack index from the `kstack_base` is as follows - 
+```c
+kstack_index(kstack_base) =  (MAXVA - PGSIZE - kstack_base)/(2*PGSIZE)
+```
+The  `clone()` function needs to assign a kernel stack succesfully to create a new thread. It will call the function whos definition is given below. `t` is the pointer to the calling thread. `base` is the pointer to the kstack's base address, which the function will assign value to if the allocation is succesful. The function will return `0` on success and `-1` on failure.
+```c
+int alloc_kstack(thread *t, uint64 *base)
+```
+The `alloc_kstack()` function will follow these steps:
+
+1. Get a page of memory by calling `kalloc()`. If it fails, then go to **Step 5**.
+2. Acquire the global `kstack_tracking_lock` lock. Find an empty stack slot by looping over `kstack_tracking` and finding first index where `kstack_tracking[index] == 0`. Lets call this index `kstack_index`. If such an index is found, mark `kstack_tracking[kstack_index] = 1`. Release the lock. If such an index is not found then go to **Step 5**
+3. Find the `kstack_base` address using the above given formula.
+4. Acquire the spin lock on `kpgtbl_lock` and map the stack page to the `kstack_base` address using `mappages()`. Keep the guard page unmapped, so that it can catch any stack overflows. Release the lock. If `mappages()` fails, go to **Step 5**. Else assign `kstack_base` to `base`. Return `0` for success.
+5. This is the **clean up** step, in case of failure. 
+   1. We need to free the stack page, if allocated. 
+   2. If `mappages()` succeeded before failure, then we need to acquire the spin lock on `kpgtbl_lock` and unmap the `kstack` page from the page table using `uvmunmap()` and then release the lock
+   3. If the `kstack_index` is marked, then we acquire the spin lock on `kstack_tracking_lock`, and then we unmark it as `kstack_tracking[kstack_index] = 0`.  Now, we release the lock.
+   4. Return `-1` for failure.
+
+Also, the kernel stack needs to be freed on thread exit. For this we follow these steps:
+1. Acquire the spin lock on `kpgtbl_lock` and unmap the stack page from page table, and free the stack page, using `uvmunmap()`. Release the lock.
+2. Use the above given formula to find the `kstack_index` from the `kstack_base`
+3. Acquire the spin lock on the `kstack_tracking_lock`.
+4. Mark the stack memory region as free as such - `kstack_tracking[kstack_index] = 0`.
+5. Release the lock
+
+
+### New allocthread() function
+It is used to create a new thread. Its definition is given below.
+```c
+int allocthread(struct thread *parent);
+```
+Here `parent` is the pointer to the caller thread. It will be `NULL` if its the first thread of the family.
+
+The `allocthread()` function the following steps - 
+1. Initialize a new thread object - `struct thread *child;`
+2. if `parent == NULL` i.e. this is the first thread in the family, then we need to initialize the shared family struct by doing the following - 
+   1. Initialize empty shared family object - `struct thread_family_shared *family;`. 
+   2. Initialize empty user page table - `family->pagetable = thread_pagetable(child)`.
+   3. Set thread count to 1 - `family->tcount = 1`
+3. Else if `parent != NULL`, use the shared struct from parent - `struct thread_family_shared *family = &parent->family;`.
+4. 
 
 New clone() user space function 
 
