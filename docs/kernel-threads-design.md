@@ -614,6 +614,28 @@ This is achieved by doing the following:
 7. Free up the family memory - `kfree(family)`.
 
 
+### Thread Lifecycle
+
+#### Birth:
+The first thread is created by `userinit()` and is saved as a global variable as `init_thread` which has a TID = 1. `init_thread` will always be the only thread in its family.
+
+
+A new thread is created in the family by calling the function `clone()`. It internally calls `alloc_thread()` by passing the calling thread's family to it. `alloc_thread()` initializes a new thread object and also allocates a new thread slot (`alloc_slot()`) and a kernel stack (`alloc_kstack()`). `clone()` also sets up the program counter with a function poiner, from where the thread can start executing.  
+So from this, you might have noticed that the `clone()` can only create a thread in the same family.
+
+To create a thread with another family, we call `fork()`. The family created by `fork()` is the child of the calling thread's family and thus the calling thread's family is the parent family. The design of parent-child relation being between families rather than threads is important for other mechanisms. `fork()` calls `alloc_family()` internally and then also calls `alloc_thread()` with the newly created family. `fork()` will use `uvmcopy_thread()` to selectively copy just the calling thread's slot and other necessary resources, rather than copying full address space as the calling thread's address space also has slots of other threads.
+
+`exec()` is used to override the the current family's running program with another one. When a thread calls `exec()`, we mark all the other threads in the family as `killed = 1` and wait for them to exit using `join()`. After all the other family threads have exited, then the address space is replaced.
+
+#### Death
+A thread can call `exit_thread()` to delete itself or can call `kill_thread(tid)` to delete a family thread with `TID = tid`. When a thread calls `kill_thread(tid)`, it sets `killed = 1` for the target thread. When this thread is hits a trap and calls `usertrap()`, it calls `exit_thread()` as its `killed` flag is set. 
+
+In `exit_thread()`, it decrements the thread count of the family. If the thread count of the calling thread's family is 0, i.e. this is the last thread in the process, then it cleans up all of the external resources of the family. It calls `reparent()` to reparent all of its children families to `init_thread`'s family. Then it wakes up the parent family's root thread (`wakeup_thread(td->parent_family.root_id)`) so that it can clean up the remaining resources. It then changes the state of the thread to `ZOMBIE` and then jumps into the scheduler.  
+
+
+
+
+
 New clone() user space function 
 
 Modified exit() function
