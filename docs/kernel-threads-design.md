@@ -200,9 +200,7 @@ struct thread {
   void *chan;                  
   int killed;                  
   int xstate;                  
-  int tid;                     
-
-  struct thread *parent;        
+  int tid;                            
 
   int kstack_index;  
   int slot_index;             
@@ -220,6 +218,8 @@ The new `struct thread` contains only the per-thread state required for scheduli
 `slot_index` is the index that this thread's slot has occupied in the `slot_tracking` array (covered in detail in the subsection 2). It has an uninitialized value of `-1`.
 
 `kstack_index` is the index that this thread's kernel stack has occupied in the global `kstack_tracking` array (covered in detail in the subsection 6). It has an uninitialized value of `-1`.
+
+Note that we have removed the `parent` field which was present in the `struct proc`. Thats because all threads belonging to a family will be sibling threads.
 
 The structure is protected by a **spin lock** rather than a sleep lock. The scheduler frequently accesses and updates thread state while selecting runnable threads. If contention on the lock caused the scheduler to sleep, scheduling itself could be blocked waiting for access to thread state, creating the possibility of deadlock. Since these operations involve only short in-memory updates, a spin lock is a more appropriate choice.
 
@@ -239,7 +239,7 @@ struct thread_family_shared {
   struct vma vmas[NVMA];
 
   struct thread_family_shared *parent_family;
-  int root_tid;
+  int fid;
 
   int tcount;
   int no_clone;
@@ -256,7 +256,7 @@ Each thread in the same family have their `family` pointer pointing to the same 
 
 `parent_family` is a pointer to the family of the parent thread that spawned this family.
 
-`root_tid` is the `tid` of the first thread created in this family.
+`fid` is unique identifier for the family. It acts as the `PID` for user programs.
 
 The `slot_tracking` array is a boolean array. If `slot_tracking[slot_index] == 1` then the thread slot at index `slot_index` is occupied, else it is unoccupied. This array is useful when assigning a **thread slot** memory region to a new thread. For a given thread's slot index, we can derive formulas for calculating the address of the thread slot's base, the top of the user stack and the base of the trapframe. These formulas are mentioned in the **Virtual Memory Layout** subsection coming up next.
 
@@ -619,7 +619,6 @@ This is achieved by doing the following:
 #### Birth:
 The first thread is created by `userinit()` and is saved as a global variable as `init_thread` which has a TID = 1. `init_thread` will always be the only thread in its family.
 
-
 A new thread is created in the family by calling the function `clone()`. It internally calls `alloc_thread()` by passing the calling thread's family to it. `alloc_thread()` initializes a new thread object and also allocates a new thread slot (`alloc_slot()`) and a kernel stack (`alloc_kstack()`). `clone()` also sets up the program counter with a function poiner, from where the thread can start executing.  
 So from this, you might have noticed that the `clone()` can only create a thread in the same family.
 
@@ -628,9 +627,21 @@ To create a thread with another family, we call `fork()`. The family created by 
 `exec()` is used to override the the current family's running program with another one. When a thread calls `exec()`, we mark all the other threads in the family as `killed = 1` and wait for them to exit using `join()`. After all the other family threads have exited, then the address space is replaced.
 
 #### Death
-A thread can call `exit_thread()` to delete itself or can call `kill_thread(tid)` to delete a family thread with `TID = tid`. When a thread calls `kill_thread(tid)`, it sets `killed = 1` for the target thread. When this thread is hits a trap and calls `usertrap()`, it calls `exit_thread()` as its `killed` flag is set. 
+A thread can call `exit_thread()` to delete itself or can call `kill_thread(tid)` to delete a family thread with `TID = tid`. When a thread calls `kill_thread(tid)`, it sets `killed = 1` for the target thread. When this thread hits a trap and calls `usertrap()`, it calls `exit_thread()` as its `killed` flag is set. 
 
-In `exit_thread()`, it decrements the thread count of the family. If the thread count of the calling thread's family is 0, i.e. this is the last thread in the process, then it cleans up all of the external resources of the family. It calls `reparent()` to reparent all of its children families to `init_thread`'s family. Then it wakes up the parent family's root thread (`wakeup_thread(td->parent_family.root_id)`) so that it can clean up the remaining resources. It then changes the state of the thread to `ZOMBIE` and then jumps into the scheduler.  
+In `exit_thread()`, it decrements the thread count of the family. If the thread count of the calling thread's family is 0, i.e. this is the last thread in the family, then it cleans up all of the external resources of the family and calls `reparent()` to reparent all of its children families to `init_thread`'s family and lastly wakes up a the threads in the parent family sleeping on the parent family's channel.  
+If this is not the last thread in the family, then we just wake up a sibling thread sleeping on the family's channel.
+We awaken this thread so that it can clean up the remaining resources of the exited process. It then changes the state of the thread to `ZOMBIE` and then jumps into the scheduler.  
+
+There are two waiting mechanisms - `wait()` and `join()`.
+
+In `wait()` the thread waits for all the threads in a child family to `exit()`. It has a infinite loop, inside which it loops over the children families to find one with no active threads i.e. `tcount == 0`. If it finds one, it calls calls `free_thread()` on each thread still in `ZOMBIE` state and then calls `free_family()` and return the freed family's `FID`.
+If it doesn't find one, it sleeps on a channel of its family, so that it is awoken by a child family's last thread exiting, to go over the loop to clear all resources.
+
+In `join()` the thread waits for a thread in the family to `exit()`. It has a infinite loop, inside which it loops over the sibling threads to find in `ZOMBIE` state. If it finds one, it calls calls `free_thread()` on it and return the freed thread's `TID`.
+If it doesn't find one, it sleeps on a channel of its family, so that it is awoken by a sibling thread exiting, to go over the loop to clear all resources.
+
+The thread's parent or the parent family's root thread wakes up (the parent family can be the original parent or it may be the `init_thread`'s family due to reparenting, whose thread has been sleeping due to calling `wait()`), due to the `wakeup_thread()` call from a child family's thread. It finds all the `ZOMBIE` threads belonging to its child familes, and calls `free_thread()` on them which internally calls `free_slot()` and `free_kstack()` to free the thread's slot and kernel stack respectively. It then checks the thread count of the thread's family and if `tcount == 0` it calls `free
 
 
 
