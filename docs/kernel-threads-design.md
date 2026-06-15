@@ -217,7 +217,7 @@ struct thread {
 
 struct spinlock thread_list_lock;
 
-struct thread init_thread;
+struct thread *init_thread;
 
 ```
 The new `struct thread` contains only the per-thread state required for scheduling, trap handling, and lifecycle management. Unlike the original `struct proc`, it does not contain resources that are shared across all threads in a thread family, such as the address space, open file table, current working directory etc. These shared fields have been moved to a separate shared data structure, to which the `family` field is a pointer to. This is described in more detail in the next section.
@@ -231,9 +231,9 @@ Note that we have removed the `parent` field which was present in the `struct pr
 The structure is protected by a **spin lock** rather than a sleep lock. The scheduler frequently accesses and updates thread state while selecting runnable threads. If contention on the lock caused the scheduler to sleep, scheduling itself could be blocked waiting for access to thread state, creating the possibility of deadlock. Since these operations involve only short in-memory updates, a spin lock is a more appropriate choice.
 
 
-Earlier we had a fixed array as the PCB, but now we move to a **Linked List** for the `TCB`. We choose this approach as this allows us to dynamically allocate threads without any strict upper bound imposed by the list. The downside is that to the traversing to a specific thread takes `O(n)` time (vs `O(1)` in earlier approach via array index). But this is fine as the scheduler loops over all the threads anyway.
+Earlier we had a fixed array as the PCB, but now we move to a **Linked List** for the Thread Control Block (TCB). We choose this approach as this allows us to dynamically allocate threads without any strict upper bound imposed by the list. The downside is that to the traversing to a specific thread takes `O(n)` time (vs `O(1)` in earlier approach via array index). But this is fine as the scheduler loops over all the threads anyway.
 
-The `next` field is a pointer to the next node in the `TCB`. 
+The `next` field is a pointer to the next node in the TCB. 
 
 `init_thread` is the head of the Linked List and also the first thread created in the system by `userinit()`. It is great as a head as it will never exit.
 
@@ -266,6 +266,8 @@ struct thread_family_shared {
 
 struct spinlock family_list_lock;
 
+struct family_thread_shared *init_family;
+
 ```
 The new `struct thread_family_shared` contains the fields common to a thread family such as the address space via the page table, the heap size (i.e. the top of the heap), the list of open files, the inode pointer to the current working directory and the list of VMAs, needed to lazy load the ELF segments of the program.
 
@@ -287,7 +289,9 @@ The `no_clone` boolean flag, basically doesn't allow for a thread to be cloned (
 
 The `tcount` field keeps count of the number of threads alive in this family.
 
-The `next` field is a pointer to the next family in the list. The family of `init_thread` i.e. `init_thread->family` is used as a head of this list as it never exits.
+Similar to the TCB, we also use a Linked List to store the Family Control Block (FCB).
+
+The `next` field is a pointer to the next family in FCB. `init_family` (`init_thread->family` = `init_family`) is used as a head of this list as it never exits.
 
 We use a **sleep lock** (`sleeplk`) to protect the shared thread-family state of `pagetable`, `ofile`, `cwd` and `vmas`. Operations on shared resources such as the page table, open file table, current working directory, and VMAs may involve acquiring inode locks, waiting for disk I/O or other actions that can cause the calling thread to sleep. A spin lock is unsuitable here because xv6 disables interrupts while a spinlock is held. If a thread holding a spinlock goes to sleep waiting for an event that depends on an interrupt (such as disk I/O completion), the interrupt cannot be delivered, resulting in a deadlock. A sleep lock avoids this issue by allowing the thread to block and yield the CPU while waiting for the resource to become available.
 
@@ -592,12 +596,18 @@ This is achieved by doing the following:
    2. Increment the thread counter - `family->tcount += 1;`.
    3. Release the lock
 8. Initialze the **return address** - `new_thread->context.ra = forkret`.
-9.  Acquire TCB lock, insert new thread into first position in TCB List and then release the lock - 
+9.  Insert thread in TCB.
+    1. If it is the first thread, then assign it to `init_thread`
+    2. Else, insert new thread into first position in TCB List
    ```c
    aquire(thread_list_lock);
-   struct thread prev_first = init_thread.next;
-   init_thread.next = new_thread;
-   new_thread.next = prev_first;
+   if (init_thread == NULL){
+      init_thread = new_thread;
+   }else{
+      struct thread prev_first = init_thread.next;
+      init_thread.next = new_thread;
+      new_thread.next = prev_first;
+   }
    release(thread_list_lock);
    ```
 10. Return 0.
@@ -618,9 +628,14 @@ void free_thread(struct thread *td)
 This function is used to free the allocated thread `td`.
 
 This is achieved by doing the following: 
-1. Free the slot - `free_slot(td);`.
-2. Free the kernel stack - `free_kstack(td);`.
-3. Remove the thread's node from TCB by doing the following:
+1. Panic if it is the `init_thread`.
+   ```c
+   if (td == init_thread)
+      panic("free_thread: attempting to free init_thread");
+   ```
+2. Free the slot - `free_slot(td);`.
+3. Free the kernel stack - `free_kstack(td);`.
+4. Remove the thread's node from TCB by doing the following:
    1. Acquire TCB lock - `aquire(thread_list_lock);`
    2. Loop over the TCB to find the thread's node (`target`) and also the node just before it (`prev_target`):
       ```c
@@ -642,7 +657,7 @@ This is achieved by doing the following:
       prev_target->next = target->next;
       ``` 
    4. Release the lock.
-4. Free the thread's node's memory - `kfree(target);`.
+5. Free the thread's node's memory - `kfree(target);`.
    
 
 
@@ -664,12 +679,18 @@ This is achieved by doing the following:
    family->tcount = 0;
    family->sz = 0;
    ```
-5. Acquire FCB lock, insert new family into first position in FCB List and then release the lock - 
+5. Insert family in FCB.
+    1. If it is the first family, then assign it to `init_family`
+    2. Else, insert new family into first position in FCB List
    ```c
    aquire(family_list_lock);
-   struct thread_family_shared prev_first = init_thread->family->next;
-   init_thread->family->next = family;
-   family->next = prev_first;
+   if (init_family == NULL){
+      init_family = family;
+   }else{
+      struct thread_family_shared prev_first = init_family->next;
+      init_family->next = family;
+      family->next = prev_first;
+   }
    release(family_list_lock);
    ```
 6. This is the **clean up** step, in case of failure:
@@ -955,3 +976,93 @@ int uvmcopy(pagetable_t old, pagetable_t new, uint64 start, uint64 sz)
 The scheduler algorithm decides which one of the `RUNNABLE` threads gets to execute next on the CPU. 
 
 Now instead of looping over the PCB, the scheduler loops over the TCB with the acquired global thread list lock to find the next thread to execute and acquires the per-thread lock to change the state of the thread. We then release the global lock before `swtch()`. The per-thread lock is held across `swtch()` and released by the newly scheduled thread after the context switch — consistent with vanilla xv6.
+
+### 9. Modified `userinit()`
+It sets up the first thread (`init_thread`) and its family (`init_family`).
+
+Global variables `init_thread` and `init_family` are originally `NULL` initialized.
+
+`userinit()` calls `alloc_family()` to allocate the first family and assigns it to `init_family`.
+It then calls `alloc_thread(init_family)` to allocate the first thread and assigns it to `init_thread`.
+
+It sets up the current working directory and marks the thread as `RUNNABLE`
+
+
+
+## Alternatives Considered
+
+### 1. Spin lock vs sleep lock for shared family fields
+We considered using spinlocks for all fields in thread_family_shared for simplicity. However, as detailed in the [Thread Family Shared Data Structure](#2-new-thread-family-shared-data-structure) section, operations on pagetable, ofile, cwd and vmas can involve disk I/O which requires sleeping. Holding a spinlock while sleeping causes deadlock since interrupts are disabled. Hence sleep locks were chosen for these fields.
+
+### 2. User-managed stacks in `clone()`
+Linux's definition for `clone()` looks something like this:
+
+```c
+int clone(
+    int (*fn)(void *),
+    void *child_stack,
+    int flags,
+    void *arg
+);
+```
+As you can see, the most important distiction here, is the `child_stack` pointer as 2nd input. Linux expects that the user will pass in a pointer to the top of a user allocated memory region (usually fromt the heap) which is incidently also the initial value of the stack pointer, by doing something like this:
+
+```c
+char *stack = malloc(STACK_SIZE);
+
+clone(
+    worker,
+    stack + STACK_SIZE,  // stack grows downward
+    CLONE_VM | CLONE_FILES | CLONE_FS,
+    NULL
+);
+```
+We have explicitly rejected this design and have the kernel allocate a fixed 1 page user stack for the new thread. We have done this to maintain simplicity of the interface, so that the user can just call the `clone()` function and not worry about allocating and deallocating the user stack while maintaining a guard page for catching stack overflows.
+
+
+### 3. Family-level vs thread-level parenting
+In vanilla xv6, processes have a parent-child relationship, in which a process will have one and only one parent (except for `initproc` which is the first process and thus has no parent, showed by having its `initproc->parent = NULL`) and can have many children.
+
+When extending this idea to threads, it might seem natural for the threads in a family to also share a similar parent-child relationship, wherein the root thread i.e. the first thread created in the family has parent as `NULL` and other threads have threads in the same family as their parents. This idea seems perfectly complementary to the *family* notation that we were going with.
+
+The problem with this arises when we talk about reparenting. Reparenting is the mechanism in which, when a thread/process is exiting, it changes the parent of all of its children to another thread/process, so that its children don't remain orphaned. In vanilla xv6, we reparented the children of an exiting process to `initproc` since we know that it will never exit.
+
+But, when the root thread of a family exits, we can't perform reparenting easily. Who should be the parent of the root thread's children ?
+- You can't make their parent `NULL` since that will create multiple root threads. 
+- You can't assign their parent to be a thread other than the root thread's children, as any other thread, will be a decendent of a root thread's child, thereby creating a cyclic tree, which is a violation.
+- You can't assign their parent to be a thread of another family since they will have completely different shared state.
+
+Due to these reasons, we rejected the idea of a parent-child relationship between the family threads. All threads in a family have the same hierarchy.
+
+
+On the other hand, this problem doesn't come up when we have parent-child relationships between **families**. When a family exits, it assigns `init_thread`'s (it is first thread ever created by the system and is the one and only thread in its family) family as the new parent to its children. We can confidently assign these children families to `init_thread->family` as we know that `init_thread` will never exit.
+
+
+
+### 4. `usertrap()` level page table locking
+In vanilla xv6, there was no need for any concurrency protection to be given to the page table, as each process's page table will only be accessed by the process itself.
+
+But now after introducing multi-threading, wherein a family of threads shares a page table, it is very important to protect the page table with locks (sleep locks in this case) on every page table access.
+
+But page tables are accessed many times throughout the code base, and going and adding locks to each access can be tedious and missing even a single one can lead to silent bugs and race conditions. Thus we were thinking whether there is a single place that we can add these locks to protect the page table access completely.
+
+And the most obvious place came as `usertrap()` since all page tables accesses pass through it. But for this, we will need to acquire the lock at the start of `usertrap()` and release it before it returns. The biggest issue with this, is that threads from the same family, but on different cores, will never be able to enter `usertrap()` at the same time. This completely serializes `usertrap()`, defeating the purpose of multi-threading.
+
+
+Hence, at the end, we decided to protect each occurrence of page table access with locks individually. While this offers perfect protection, it still reduces concurrency since more than one thread can't access the page table simultaneously even for reads.
+
+
+
+### 5. Identity-mapped vs Explicitly-mapped Kernel Stacks
+
+When allocating kernel stacks, we could have used the physical address of the kernel stack as its virtual address itself (since it is identity mapped) as we know that it will be unique. There is no need for any mappings, like there is for user stack, since user stacks exists in Userspace Virtual Memory, which is defined by the user page table wherein a physical address of memory can be mapped to any virtual address. This is necessary as the physical address of the memory allocated for user stack, might fall into a different region than what is defined by the [User Space Memory Layout](#3-new-memory-layout).
+
+But the problem with this decision of using identity mapped VA for kernel stacks, is that we can't guarantee that the page of memory below it will always remain unallocated to act as a guard page. It can readily be picked up by any `kalloc()` access. The only way to guarantee that the page below is unoccupied is to allocate it and mark it as read-only so writing to it causes a page fault. But this wastes a physical page of memory per kernel stack, just to act as a guard page.
+
+A better alternative is to allocate a page of memory and map it to a kernel space virtual address, and leave the page after that as unmapped so that it can act as a guard page to catch stack overflows through page faults. Hence why we take this approach, and thus we need the global `kstack_tracking` array to track the kernel allocations according to the new [Kernel Space Memory Layout](#kernel-virtual-address-space)
+
+## Future Work
+
+1. A **Read-write Lock** for the page table in the shared family structure would increase parallelism for page table access. Currently, all page table accesses are serialized through a single sleep lock, even read-only operations that could safely run concurrently. A read-write lock would allow multiple threads to read from the page table simultaneously, while still serializing writes."
+2. Using a **Concurrent Linked List** for the TCB and FCB will increase concurrency as it would allow multiple threads to modify the structure of the TCB and FCB in parallel.
+3. A **Production-grade Virtual Memory Allocator**, similar to Linux's mmap(), would address several limitations of our current fixed formula-based memory layout. Currently, each thread stack is fixed at one page and cannot grow, and stacks and heap compete for the same free virtual address space, limiting both the number of threads and heap growth. A flexible allocator would allow dynamic stack growth, unconstrained heap growth, and flexible placement of memory regions — effectively removing the hard dependency on `HEAP_RESERVE` as a static boundary.
