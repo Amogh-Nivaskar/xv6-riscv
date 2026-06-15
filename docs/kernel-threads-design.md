@@ -153,6 +153,8 @@ Contains the complete CPU register state of a process in user mode. It is saved 
 ### User Trap Handler - `usertrap()`
 Handles a trap originating from user mode, such as an interrupt, exception, or system call. It is invoked from **trampoline.S** after the full user CPU state has been saved into the process's `trapframe`, and the kernel stack pointer and kernel page table have been restored from the `trapframe`. Depending on the cause of the trap, it either handles the event directly or, in the case of a timer interrupt, calls `yield()` to allow another process to run. Once trap handling is complete, it calls `usertrapret()` to prepare for returning to user mode.
 
+An important point to keep in mind, is that in **trampoline.S** the trapframe address used is hardcoded in the `TRAPFRAME` variable, as each process uses a single trapframe and thus we always keep it just below the Trampoline page i.e at `MAXVA - 2PGSIZE` as can be seen in the [memory layout section](#user-mode-virtual-address-space-memory-layout)
+
 ### User Trap Return - `usertrapret()` (or `prepare_return()` in our code)
 Prepares a process to return from kernel mode to user mode after a trap has been handled. It stores the kernel state required for future traps in the process's `trapframe`, configures the CPU control registers so that `sret` will return to user mode, switches to the process's user page table, and then transfers control to the **trampoline.S** `userret()` routine, which restores the saved user register state and executes sret.
 
@@ -231,7 +233,7 @@ The structure is protected by a **spin lock** rather than a sleep lock. The sche
 
 Earlier we had a fixed array as the PCB, but now we move to a **Linked List** for the `TCB`. We choose this approach as this allows us to dynamically allocate threads without any strict upper bound imposed by the list. The downside is that to the traversing to a specific thread takes `O(n)` time (vs `O(1)` in earlier approach via array index). But this is fine as the scheduler loops over all the threads anyway.
 
-The `next` field is a pointer to the next node in the list. 
+The `next` field is a pointer to the next node in the `TCB`. 
 
 `init_thread` is the head of the Linked List and also the first thread created in the system by `userinit()`. It is great as a head as it will never exit.
 
@@ -267,7 +269,7 @@ struct spinlock family_list_lock;
 ```
 The new `struct thread_family_shared` contains the fields common to a thread family such as the address space via the page table, the heap size (i.e. the top of the heap), the list of open files, the inode pointer to the current working directory and the list of VMAs, needed to lazy load the ELF segments of the program.
 
-**NOTE:** The sleep lock should be held wherever any kind of page table access needs to be made. So the existing page table access need to be modified to hold the lock.
+[**NOTE:** The sleep lock should be held wherever any kind of page table access needs to be made. So the existing page table access need to be modified to hold the lock.]
 
 Each thread in the same family have their `family` pointer pointing to the same `struct thread_family_shared` object.
 
@@ -374,7 +376,43 @@ heap_reserve = initial_sz + (HEAP_RESERVE_PAGES * PGSIZE)
 This approach provides a simple and predictable balance between thread creation and dynamic memory allocation. By reserving address space for future heap growth, the design prevents excessive thread creation from starving the heap while still allowing unused reserved space to be utilized by the heap when required.
 
 
-### 4. Thread Lifecycle
+### 4. Modified Trap Handling for Per-thread Trapframes
+
+As mentioned in the [User Trap handling subsection](#user-trap-handler---usertrap), earlier we used to only have one trapframe per process and thus the trapframe address was hardcoded in **trampoline.S**
+
+But now, multiple thread's share the same address space and each thread needs its own trapframe to store its kernel execution state.
+Hence, we now need to find a way to make the **trampoline.S** aware of where the thread's trapframe is located. 
+
+To do this, we first need to get the `trapframe_base` address, using the formula specified in [New Memory Layout section](#3-new-memory-layout).
+
+Now we need to get the thread's trapframe base VA into sscratch. For this we will need to add two functions - 
+```c
+static inline void w_sscratch(uint64 x) {
+  asm volatile("csrw sscratch, %0" : : "r" (x));
+}
+
+static inline uint64 r_sscratch() {
+  uint64 x;
+  asm volatile("csrr %0, sscratch" : "=r" (x));
+  return x;
+}
+```
+
+Then we modify the `prepare_return()` (earlier `usertrapret()`) to accesses the current thread via `mythread()` and uses `td->slot_index` with the `trapframe_base()` formula to compute the correct trapframe VA before writing it to sscratch with `w_sscratch(trapframe_base)`.
+
+Lastly, in **trampoline.S** we swap these 2 lines  -  
+   1. `csrw sscratch, a0` - load the value of register a0 into register sscratch, so that we don't lose the value in a0.
+   2. `li a0, TRAPFRAME` - loads the hardcoded trapframe address into register a0
+with this -  
+`csrrw a0, sscratch, a0` - which does an atomic swap between the values of register a0 and register sscratch.  
+
+After the instruction is executed, a0 now has the trapframe VA and sscratch has the earlier a0's value. From here on out, the trampoline can function just as it did.
+
+
+
+
+
+### 5. Thread Lifecycle
 
 #### Birth:
 The first thread is created by `userinit()` and is saved as a global variable as `init_thread` which has a `TID = 1`. `init_thread` will always be the only thread in its family.
@@ -393,7 +431,8 @@ When a thread calls `kill_thread(tid)`, it sets `killed = 1` for the target thre
 
 In `exit_thread()`, it decrements the thread count of the family. If the thread count of the calling thread's family is 0, i.e. this is the last thread in the family, then it cleans up all of the external resources of the family and calls `reparent()` to reparent all of its children families to `init_thread`'s family and lastly wakes up a thread in the parent family sleeping on the parent family's channel.  
 If this is not the last thread in the family, then we just wake up a sibling thread sleeping on the family's channel.
-In both the above mentioned cases, we awaken a different thread (either a sibling thread or parent family's thread), so that it can clean up the remaining resources of the exited process. It then changes the state of the thread to `ZOMBIE` and then jumps into the scheduler.  
+In both the above mentioned cases, we awaken a different thread (either a sibling thread or parent family's thread), so that it can clean up the remaining resources of the exited process.  
+It then changes the state of the thread to `ZOMBIE` and then jumps into the scheduler.  
 
 `exit()` is used to delete the full family. Internally, it calls `kill_thread()` on each thread in the family. 
 
@@ -412,7 +451,7 @@ If it doesn't find one, it sleeps on a channel of its family, so that it is awok
 
 
 
-### 5. Per-thread Slot handling with Per-thread Slot Tracking array 
+### 6. Per-thread Slot handling with Per-thread Slot Tracking array 
 The  `clone()` function needs to assign a user stack succesfully to create a new thread. It will call the function whos definition is given below.  `td` is the a pointer to the thread for whom we are allocating a slot. The function will return `0` on success and `-1` on failure.
 ```c
 int alloc_slot(struct thread *td)
@@ -472,7 +511,7 @@ For this we follow these steps:
 9. Unmark the slot index - `td->slot_index = -1;`.
 
 
-### 6. Per-thread Kernel Stack handling with Global Kernel Stack Tracking array 
+### 7. Per-thread Kernel Stack handling with Global Kernel Stack Tracking array 
 Unlike earlier where we used to allocate all `NPROC` kernel stacks when the kernel boots up, now we don't allocate any kernel stacks at boot time. When a new thread is being created, we allocate a dedicated kernel stack for it. Other than that, the memory layout doesn't change at all. Here also we run into the same problem of needing to track which stack regions are occupied and which aren't and so here we use a global kernel stack tracking array (`kstack_tracking`) similar to the per-thread slot tracking array but this one only tracks kernel stacks, along with a global lock (`kstack_tracking_lock`) to protect it. We also add a spin lock (`kpgtbl_lock`) to protect the kernel page table. Earlier we didn't need one as after the kernel boot, the kernel page table was essentially read-only. That is not the case now and so we do need a lock to protect it.
 ```c
 int kstack_tracking[NTHREADS];
@@ -531,7 +570,7 @@ For this we follow these steps:
 5. Unassign the kernel stack index - `td->kstack_index = -1;`.
 
 
-### 7. Allocation & Deallocation of a thread
+### 8. Allocation & Deallocation of a thread
 
 ```c
 int alloc_thread(struct thread_family_shared *family, struct thread **new_thread)
@@ -542,15 +581,16 @@ This is achieved by doing the following:
 1. Allocate memory for a thread - `*new_thread = (struct thread *)kalloc();`. On failure go to *Step 11*.
 2. Zero initialize thread's next pointer - `new_thread->next = NULL;`.
 3. Assign the family pointer for child thread - `new_thread->family = family;`
-4. Initialize thread's index fields with sentinal values -
+4. Initialize thread's index fields with sentinal values and state -
    1. `new_thread->kstack_index = -1;`
    2. `new_thread->slot_index = -1;`
+   3. `new_thread->state = UNUSED;`
 5. Allocate thread slot by calling -  `alloc_slot(new_thread)`. On failure go to *Step 11*.
 6. Allocate kernel stack by calling - `alloc_kstack(new_thread)` On failure go to *Step 11*.
 7. Increment thread count by doing the following:
-      1. Acquire the family shared spin lock `spinlk`.
-      2. Increment the thread counter - `family->tcount += 1;`.
-      3. Release the lock
+   1. Acquire the family shared spin lock `spinlk`.
+   2. Increment the thread counter - `family->tcount += 1;`.
+   3. Release the lock
 8. Initialze the **return address** - `new_thread->context.ra = forkret`.
 9.  Acquire TCB lock, insert new thread into first position in TCB List and then release the lock - 
    ```c
@@ -584,8 +624,8 @@ This is achieved by doing the following:
    1. Acquire TCB lock - `aquire(thread_list_lock);`
    2. Loop over the TCB to find the thread's node (`target`) and also the node just before it (`prev_target`):
       ```c
-      struct thread *target = thead->next;
-      struct thread *prev_target = thead;
+      struct thread *target = init_thread->next;
+      struct thread *prev_target = init_thread;
       
       while (target != NULL){
          if (target->tid == td.tid) break;
@@ -606,7 +646,7 @@ This is achieved by doing the following:
    
 
 
-### 8. Allocation & Deallocation of a thread's family
+### 9. Allocation & Deallocation of a thread's family
 
 ```c
 struct thread_family_shared* alloc_family()
@@ -614,16 +654,25 @@ struct thread_family_shared* alloc_family()
 This function allocates a family and returns a pointer to it.
 
 This is achieved by doing the following: 
-1. Allocate memory for shared family object - `struct thread_family_shared *family = kalloc();`. On failure go to *Step 4*.
-2. Initialize empty user page table - `family->pagetable = thread_pagetable()`. On failure go to *Step 4*.
-3. Zero initialze some family fields - 
+1. Allocate memory for shared family object - `struct thread_family_shared *family = kalloc();`. On failure go to *Step 6*.
+2. Assign calling thread's family as parent - `family->parent = mythread()->family`
+3. Initialize empty user page table - `family->pagetable = thread_pagetable()`. On failure go to *Step 6*.
+4. Zero initialze some family fields - 
    ```c
    family->slot_tracking = {0};
    family->no_clone = 0;
    family->tcount = 0;
    family->sz = 0;
    ```
-4. This is the **clean up** step, in case of failure:
+5. Acquire FCB lock, insert new family into first position in FCB List and then release the lock - 
+   ```c
+   aquire(family_list_lock);
+   struct thread_family_shared prev_first = init_thread->family->next;
+   init_thread->family->next = family;
+   family->next = prev_first;
+   release(family_list_lock);
+   ```
+6. This is the **clean up** step, in case of failure:
    1. If failure is after *Step 1*, free the memory allocated for family - `kfree(family)`.
    2. If failure is after *Step 2*, free up the page table, trampoline and heap - `thread_freepagetable(family->pagetable, family->sz);`. 
 
@@ -647,11 +696,33 @@ This is achieved by doing the following:
 4. Acquire the family sleep lock `sleeplk`.
 5. Free up the page table, trampoline and heap - `thread_freepagetable(family->pagetable, family->sz);`
 6. Release the lock.
-7. Free up the family memory - `kfree(family)`.
+7. Remove the family's node from FCB by doing the following:
+   1. Acquire FCB lock - `aquire(family_list_lock);`
+   2. Loop over the TCB to find the family's node (`target`) and also the node just before it (`prev_target`):
+      ```c
+      struct thread *target = init_thread->family->next;
+      struct thread *prev_target = init_thread->family;
+      
+      while (target != NULL){
+         if (target->fid == family.fid) break;
+         target = target->next;
+         prev_target = prev_target->next;
+      }
+
+      if (target == NULL) {
+         panic("Family node not found in FCB");
+      }
+      ```
+   3. Remove the thread's node from TCB:
+      ```c
+      prev_target->next = target->next;
+      ``` 
+   4. Release the lock.
+8. Free up the family memory - `kfree(family)`.
 
 
 
-### 9. Creating a new sibling thread
+### 10. Creating a new sibling thread
 
 ```c
 int clone(void (*fn)(void *), void *arg)
@@ -676,37 +747,211 @@ To achieve this, it does the following:
 7. return `td->tid`.
 
 
-New exit_thread() user space function 
+### 11. Exit a thread from user space 
 
 ```c
-void exit_thread()
+void exit_thread(int status)
 ```
-It is called by a thread when it wants to delete itself.
+It is called by a thread when it wants to delete itself and is passed in a status argument which is the output of the thread execution.
 
 To achieve this, it does the following:
-1. Access calling thread's family - `struct thread_family_shared *family = mythread()->family;`
-2. Decrement threads count:
+1. Access calling thread - `struct thread *td = mythread()`
+2. Access calling thread's family - `struct thread_family_shared *family = td->family;`
+3. Acquire global spin lock `wait_lock`.
+4. Decrement threads count:
    1. Acquire spin lock `spinlk` on family.
    2. Decrement threads counter - `family->tcount -= 1`
-   3. Release lock
-3. If `family->tcount == 0`, then do the following:
-   1. Acquire global spin lock `wait_lock`.
-   2. Acquire sleep lock `sleeplk` on the family
-   3. Clean up all externel resources of the family i.e. the open files, the current working directory inode, the VMAs.
-   4. Release the `sleeplk` lock.
-   5. Acquire global spin lock `family_list_lock`.
-   6. Call `reparent()` to change the parent family of all of its children families to `init_thread->family`.
-   7. Release the `family_list_lock` lock.
-   8. Wake up a thread in the parent family, sleeping on the parent family's channel - `wakeup(family->parent)`
+   3. Save current thread count - `int thread_count = family->tcount`
+   4. Release lock
+5. If `thread_count == 0`, then do the following or else go to *step 6*:
+   1. Acquire sleep lock `sleeplk` on the family
+   2. Clean up all externel resources of the family i.e. the open files, the current working directory inode, the VMAs.
+   3. Release the `sleeplk` lock.
+   4. Acquire global spin lock `family_list_lock`.
+   5. Call `reparent()` to change the parent family of all of its children families to `init_thread->family`.
+   6. Release the `family_list_lock` lock.
+   7. Wake up a thread in the parent family, sleeping on the parent family's channel - `wakeup(family->parent_family)`.
+6. Else, then we wake up a sibling thread sleeping on the family's channel - `wakeup(family)`.
+7. Updating the dying state of the thread:
+   1. Acquire spin lock `lock` on the thread
+   2. Save the exit status - `td->xstate = status;`
+   3. Change the state - `td->state = ZOMBIE;`
+   [**NOTE :** The thread's spin lock is acquired, but not explicitly released here, as it should be held when calling `sched()` and released by the scheduler after context switch. ]
+8. Release `wait_lock`.
+9.  Jump into the scheduler, never to return to this thread - `sched()`.
 
 
 
-Modified exit() function
+### 12. Exit the entire thread family from user space
+
+```c
+void exit(int status)
+```
+
+It is called by a thread to exit its entire family.
+
+It achieves this by doing the following:
+1. Access calling thread - `struct thread *td = mythread()`
+2. Access calling thread's family - `struct thread_family_shared *family = td->family;`
+3. Turn off cloning:
+   1. Acquire the spin lock no the family
+   2. Turn off cloning - `family->no_clone = 1`
+   3. Store siblings count - `int siblings = family->tcount - 1`
+   4. Release lock
+4. Acquire the global spin lock on the TCB (`thread_list_lock`)
+5. Loop through the TCB and for every sibling child excluding itself, call `kill_thread(tid)`.
+   ```c
+   for (struct thread th in TCB){
+      if (th->family == family && th != td){
+         kill_thread(th->tid);
+      }
+   }
+   ```
+6. Release the lock
+7. Wait for all sibling threads to exit:
+   ```c
+   for (int i = 0; i < siblings; i++) {
+    join(NULL);
+   }
+   ```
+8. Exit itself - `exit_thread(status)`
 
 
-Modified exec() function 
+### 13. Copying thread state
 
-Modified fork() function 
+```c
+int copy_state_thread(struct thread *td)
+```
+It copies the calling thread's virtual memory, family state and thread state into the thread `td`. Will be used in the modified `fork()`.
 
-Modified Scheduler
+It achieves this by doing the following:
+1. Create instance of calling thread - `struct thread *calltd = mythread()`
+2. Create instance of calling thread's family - `struct thread_family_shared *callfamily = calltd->family`
+3. Create instance of `td`'s family - `struct thread_family_shared *family = td->family`.
+4. Acquire locks on both families, ordered by address to avoid deadlocks
+   ```c
+   if (callfamily < family){
+      acquire(callfamily->sleeplk);
+      acquire(family->sleeplk);
+   }else{
+      acquire(family->sleeplk);
+      acquire(callfamily->sleeplk);
+   }
+   ```
+5. Copy the calling thread's ELF + heap into `td`'s virtual memory: `uvm_copy(callfamily->pagetable, family->pagetable, 0, callfamily->sz)`. On failure, return -1.
+6. Get the user stack of calling thread - `uint64 ustack_base = ustack_top(callthread->slot_index) - PGSIZE`
+7. Copy the calling thread's user stack into `td`'s virtual memory - `uvm_copy(callfamily->pagetable, family->pagetable, ustack_base, PGSIZE)`. On failure, return -1.
+8. Increment reference counts on open file descriptors:
+   ```c
+   for(i = 0; i < NOFILE; i++)
+    if(callfamily->ofile[i])
+      family->ofile[i] = filedup(callfamily->ofile[i]);
+   family->cwd = idup(callfamily->cwd);
+   ```
+9.  Copy heap size - `family->sz = callfamily->sz`
+10. Copy heap reserve - `family->heap_reserve = callfamily->heap_reserve`
+11. Set the slot tracking array for `td` - `family->slot_tracking[calltd->slot_index] = 1`
+12. Copy calling thread's VMA's list - `memmove(family->vmas, callfamily->vmas, sizeof(callfamily->vmas));`
+13. Increment reference count of VMA's file inodes:
+   ```c
+   for (int i=0; i<NVMA; i++){
+      struct vma v = family->vmas[i];
+      if (v.inode != 0){
+         idup(v.inode);
+      }
+   }
+   ```
+14. Release locks on both families, ordered by address to avoid deadlocks
+   ```c
+   if (callfamily < family){
+      release(callfamily->sleeplk);
+      release(family->sleeplk);
+   }else{
+      release(family->sleeplk);
+      release(callfamily->sleeplk);
+   }
+   ```
+15. Copy the calling thread's trapframe into `td`'s trapframe - `*(td->trapframe) = *(calltd->trapframe)`
+16. Copy calling thread name - `safestrcpy(td->name, calltd->name, sizeof(calltd->name));`
+17. Copy calling thread's slot index - `td->slot_index = calltd->slot_index`
+18. Return 0.
 
+
+### 14. Derived Mechanisms
+This subsection is dedicated to mechanisms which are derived from existing designs in vanilla xv6.
+
+#### 1. Modified `int wait(uint64 addr)`
+This allows a thread to wait for all the threads of a child family to exit.
+
+Here, instead of looping over the processes to find a child zombie process, it will loop over families to find a dead child family i.e. `tcount == 0`.
+If it is found, it then loops over the TCB to find all the zombie threads and for each such thread `zb_td`, it calls `free_thread(zb_td)`.
+At last it then calls `free_family(dead_family)` to free the dead family, stores exit status in passed address and then return its FID.
+
+If it doesn't find such a family, it sleeps on its own family as the channel, so that it is awoken when a child exits and it is the last child in its family. After it is awoken, it repeats the same process again.
+
+#### 2. Derived `int join(uint64 addr)`
+It allows a thread to wait for a sibling thread i.e. a thread belonging to the same family, to exit.
+
+Its structure is very similar to the new `wait()`.
+It loops over the TCB, to find a zombie sibling thread (`zb_td`).  
+If it is found, it frees this thread by calling `free_thread(zb_td)`, stores exit status in passed address and then returns its TID 
+
+If it doesn't find such a thread, it sleeps on its own family as the channel, so that it is awoken when a sibling thread exits. After it is awoken, it repeats the same process again.
+
+#### 3. Derived `kill_thread(tid)`
+It sets up the thread with the passed in TID to be killed.
+
+To achieve this, it loops over all the threads in the TCB, and when it finds one with the matching TID, it sets `killed = 1` and then returns 0.
+
+If no such thread is found, it returns -1.
+
+#### 4. Modified `kill(fid)`
+It sets up all the threads of the family with the passed in FID to be killed.
+
+To achieve this, it first loops over the families and to find one with the matching FID. Once if finds this family, it calls `kill_thread()` on each of its threads and then returns 0.
+
+If it doesn't such a family, it returns -1.
+
+#### 5. Modified `exec()`
+It overrides the calling thread's current running program with a new one.
+
+To achieve this, it first turns off cloning and then kills all of its sibling threads and waits for them to exit using `join()`.
+
+The rest of the execution is similar to the original, except that rather than setting up the fields on a process, we are doing it on the thread and its family. 
+
+To be more precise, we override the family's page table (`pagetable`), heap size (`sz`), VMAs list (`vmas[]`). In case of the thread itself, we override the program counter (`trapframe->epc`) and user stack pointer (`trapframe->sp`) in trapframe and the kernel stack pointer in the context (`context->sp`)
+
+In case of the user stack pointer, we place it back at the base of the already allocated user stack (in the thread's slot).
+
+In case of the heap size, we place it at just after the loaded Program Code pages.
+
+Also, for the `heap_reserve`, we recalculate it based on the new heap base.
+
+The calling thread's slot is reused for the new program's slot, so no new slot allocation is needed.
+
+#### 6. Modified `fork()`
+It creates a new family with a new thread with the same execution state as the parent family and calling thread.
+
+It makes use of a few functions that we have already defined to make this easier.
+It creates a new family - `struct thread_family_shared *family = alloc_family()`.
+It then creates a new thread - `struct thread *td = alloc_thread(family)`.
+Then it uses `copy_state_thread(td)` which copies the calling thread's virtual memory, family state and thread state into the new thread `td`.
+
+Have it return 0 in the new thread - `td->trapframe->a0 = 0`
+
+Set child state to `RUNNABLE`.
+
+Lastly, return the new family's FID to parent and 0 to child.
+
+#### 7. Modified `uvm_copy()`
+Right now, `uvm_copy()` only copies the memory starting from 0 to `sz`. We extend it so that it accepts a starting virtual address, and copies memory from there till it covers `sz`.
+
+```c
+int uvmcopy(pagetable_t old, pagetable_t new, uint64 start, uint64 sz)
+```
+
+
+#### 8. Modified Scheduler
+The scheduler algorithm decides which one of the `RUNNABLE` threads gets to execute next on the CPU. 
+
+Now instead of looping over the PCB, the scheduler loops over the TCB with the acquired global thread list lock to find the next thread to execute and acquires the per-thread lock to change the state of the thread. We then release the global lock before `swtch()`. The per-thread lock is held across `swtch()` and released by the newly scheduled thread after the context switch — consistent with vanilla xv6.
