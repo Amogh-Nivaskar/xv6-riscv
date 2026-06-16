@@ -1,14 +1,13 @@
-# Kernel Threads xv6 Extension Design
+# Kernel Threads xv6 Extension Design Document
 
 
 ## Contents
-1. Overview — A brief summary of what you're building and why. What problem does it solve?
-2. Goals and Non-Goals — What is explicitly in scope and what are you deliberately leaving out.
-3. Background — Relevant context about the existing system. In your case, how xv6 currently works that is relevant to your changes.
-4. Design — The meat of the document. Broken into subsections covering each major component of your design. Data structures, algorithms, system call interfaces etc.
-5. Alternatives Considered — Design decisions where you had multiple options and why you chose what you did.
-6. Open Questions — Things you haven't fully resolved yet.
-7. Future Work — Things explicitly out of scope now but worth considering later.
+1. [Overview](#overview) — A brief summary of what we're building and why. What problem does it solve?
+2. [Goals](#goals) and [Non-Goals](#non-goals) — What is explicitly in scope and what are we deliberately leaving out.
+3. [Background](#background) — Relevant context about the existing system. In our case, how xv6 currently works that is relevant to our changes.
+4. [Design](#design) — The meat of the document. Broken into subsections covering each major component of our design. Data structures, algorithms, system call interfaces etc.
+5. [Alternatives Considered](#alternatives-considered) — Design decisions where we had multiple options and why we chose what we did.
+6. [Future Work](#future-work) — Things explicitly out of scope now but worth considering later.
 ---
 
 ## Overview
