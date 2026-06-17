@@ -1,4 +1,4 @@
-# Kernel Threads xv6 Extension Design Document
+# **Kernel Threads xv6 Extension Design Document**
 
 
 ## Contents
@@ -21,36 +21,39 @@ Lets say you have a single process running on a multi-core CPU that needs to run
 The basic idea, is to create a new fundamental mode of execution called `Threads` (or `Tasks` like in Linux) rather than a `Process`. It can be thought of as a Process being made up of multiple Threads. The reason that multiple threads can run in parallel is that a family of threads shares the same Address Space, but has its own independent execution context. Meaning, it can run independently on a core, as if it were its own process. But these threads can also interact with each other, as they share memory and resources.
 
 ### How do we achieve this ?  
-We need to redefine the `struct proc` into a `struct thread` which will have the independent fields needed for a single threads execution context such as thread ID, instruction pointer, user stack, kernel stack, state, family (a pointer to the shared struct) etc. We also create a `struct thread_family_shared` which contains the shared resources between a family of threads such as the page table, the open files, the current working directory inode and the VMAs list (it is used for lazy loading the ELF pages of the program, and hence needs to be in the shared fields). As mentioned above, each thread in a family has a pointer to the same shared struct. We also need to change the virtual memory layout to accommodate a user stack for each thread within a single Address Space. 
+We need to redefine the `struct proc` into a `struct thread` which will have the independent fields needed for a single threads execution context such as thread ID, instruction pointer, user stack, kernel stack, state, family (a pointer to the shared struct) etc. We also create a `struct thread_family_shared` which contains the shared resources between a family of threads such as the page table, the open files, the current working directory inode and the VMAs list (it is used for lazy loading the ELF pages of the program, and hence needs to be in the shared fields). As mentioned above, each thread in a family has a pointer to the same shared struct. We also need to change the virtual memory layout to accommodate a user stack and trapframe for each thread within a single Address Space. 
 
-We also need to add two new userspace APIs:
+We also need to add three new userspace APIs:
 - `int clone(void (*fn)(void *), void *arg);`
 - `void exit_thread(void);`
+- `int join(uint64 addr);`
 
-`clone()` creates a new child thread from the currently running thread. The caller provides a function pointer indicating where the new thread should begin execution, along with the argument to pass to that function. `exit_thread()` terminates the calling thread.
+`clone()` creates a new child thread from the currently running thread. The caller provides a function pointer indicating where the new thread should begin execution, along with the argument to pass to that function. `exit_thread()` terminates the calling thread. `join()` makes the calling thread wait for a sibling thread to exit.
 
 We also need to modify the behavior of some existing system calls:
 
-- `fork()` should copy only the calling thread into the child process, and not any of its other family threads.
-- `exec()` should terminate the rest of the family threads before replacing the calling thread's full thread family with the new program image.
+- `fork()` should copy only the calling thread into a new thread, and not any of its other family threads.
+- `exec()` should terminate the rest of the family threads before replacing the calling thread's family with the new program image.
 
 ## Goals
 
 1. A family of threads should properly share the address space and resources, while each having independent execution context.
-2. Userspace Virtual Memory Layout needs to be modified to accommodate dynamic creation and destruction of per-thread user stack with guard pages.
+2. Userspace Virtual Memory Layout needs to be modified to accommodate dynamic creation and destruction of per-thread trapframe and user stack with guard pages.
 3. Support creation and destruction of per-thread kernel stack in the Kernel Virtual Address Space.
 4. A thread can be safely created only if all of the following conditions are satisfied:
    - Free physical pages are available for the thread's user stack (ustack).
+   - Free physical pages are available for the thread's trapframe.
    - Free physical pages are available for the thread's kernel stack (kstack).
-   - A contiguous region of unused virtual address space exists for the user stack and its guard page.
-   - The selected stack region does not overlap with the process heap.
+   - A contiguous region of unused virtual address space exists for the trapframe and user stack and its guard page.
+   - The selected trapframe + stack region does not overlap with the heap.
 5. The shared family struct should be properly protected for concurrent safety.
 6. Threads should exit cleanly, freeing their resources without leaking memory
 7. The Thread Control Block, should be modified to support dynamic creation and destruction of threads, with concurrent safety.
 8. Create new syscall `clone()` to create a new child thread.
 9. Create new syscall `exit_thread()` to exit the calling thread.
-10. Existing syscalls - `fork()` and `exec()` need to be modified to handle multi-threaded behaviour.
-11. Scheduler should be modfied to safely find thread to run, and change its state, while achieving maximum possible concurrency.
+10. Create new syscall `join()` to wait for a thread to exit.
+11. Existing syscalls - `fork()` and `exec()` need to be modified to handle multi-threaded behaviour.
+12. Scheduler should be modfied to safely find thread to run, and change its state, while achieving maximum possible concurrency.
 
 ## Non-goals
 
@@ -66,21 +69,26 @@ We also need to modify the behavior of some existing system calls:
 The Process, defined by `struct proc` is the execution state of a program. It contains the process's page table, state, trapframe, context, open files list, current working directory inode, VMAs list etc.
 
 ### Process Control Block (PCB)
-The PCB is defined as `struct proc[NPROC]`, which is a fixed size array. Meaning that regardless of how many processes are running, we have to keep the whole array initialized. Also, you can't have more than NPROC processes running at any given time, due to the fixed length. This fixed array approach motivates our switch to a dynamic linked list in the new design.
+The PCB is defined as `struct proc[NPROC]`, which is a fixed size array. Meaning that regardless of how many processes are running, we have to keep the whole array initialized. Also, you can't have more than `NPROC` processes running at any given time, due to the fixed length. This fixed array approach motivates our switch to a dynamic linked list in the new design.
 
 ### Process Lifecycle
-The first process is created by `userinit()` and is saved as a global variable as `initproc` which has a PID = 1. A new process can be spun up by calling `fork()` which creates a new child process by copying the full address space of the parent process. `exec()` can be called by a process to change the program running on it thereby overriding its entire address space. A parent process can call `wait()`, to wait for a child process to finish execution and get the child's PID.  
+The first process is created by `userinit()` and is saved as a global variable as `initproc` which has a PID of 1. A new process can be spun up by calling `fork()` which creates a new child process by copying the full address space of the parent process. `exec()` can be called by a process to change the program running on it thereby overriding its entire address space. A parent process can call `wait()`, to wait for a child process to finish execution and get the child's PID.  
+
 The mechanism of deleting a process is not this straight forward. The reason for that is that a process cannot delete itself, due to that fact that deleting a process includes freeing the kernel stack. But you can't free the kernel stack while you are still executing code on that stack. So we need to work around this.  
-When ever a process wants to delete itself, it calls `exit()` and if it wants to delete another process, it calls `kill(pid)` with the target process's PID. 
-`kill(pid)` loops over the PCB to find the process with the given PID and sets its killed flag `p->killed = 1`. Now, whenever this process traps into kernel mode, and if its `killed` flag is set, then it calls `exit()`.  
+
+Whenever a process wants to delete itself, it calls `exit()` and if it wants to delete another process, it calls `kill(pid)` with the target process's PID. 
+`kill(pid)` loops over the PCB to find the process with the given PID and sets its killed flag `p->killed = 1`. Now, whenever this process traps into kernel mode, as its `killed` flag is set, it calls `exit()`.  
 `exit()` cleans up all the external resources like the open files, the current working directory inode (ideally the VMAs clean up should also happen here as it is also an external resource, but is kept in `freeproc()`). It changes the parent of all of this process's children to `initproc` so that they don't become orphaned once this process is deleted. Then it wakes up its parent process `wakeup(p->parent)`, as it maybe sleeping in `wait()`. It then changes the state of the process to `ZOMBIE` and jumps into the scheduler.
-The process's parent wakes up from its sleep from inside `wait()` and for each of its child (including the earlier process) that has a state of `ZOMBIE`, it calls `freeproc()`, which frees the child process's page table and heap. It cleans the state of the child process and marks state as `UNUSED`, so that it can be picked up to be used for another process.  
-Since `struct proc` is statically allocated in a fixed array, `freeproc()` does not free the struct itself — it simply marks the slot as `UNUSED` so it can be reused for a future process. Similarly, kernel stacks are pre-allocated at boot time and are never freed, just reused. This is in contrast to our new design where both thread structs and kernel stacks are dynamically allocated and must be explicitly freed.
+
+The process's parent wakes up from its sleep from inside `wait()` and looks for a child (including the earlier process) that has a state of `ZOMBIE`, and calls `freeproc()` on it, which frees the child process's page table and heap. It cleans the state of the child process and marks state as `UNUSED`, so that it can be picked up to be used for another process.  
+
+Since `struct proc` is statically allocated in a fixed array, `freeproc()` does not free the struct itself — it simply marks the slot as `UNUSED` so it can be reused for a future process. Similarly, kernel stacks are pre-allocated at boot time and are never freed, just reused. This is in contrast to our new design where both thread objects and kernel stacks are dynamically allocated and must be explicitly freed.
 
 
 ### Kernel Stacks
 Each process has its own kernel stack. When a process enters kernel mode (for eg: during a syscall), it switches its SP (stack pointer) from the user stack (ustack) to the kernel stack (kstack).  
-When the kernel boots, the kstacks for all the `NPROC` processes are initialized in the kernel page table. `procinit()` initializes the kstack pointers for all `NPROC` processes using `KSTACK(i)`, which is a fixed formula to compute the kstack address via the process index `i`. The actually kstack allocation for each process is done in  `proc_mapstacks()`, which allocates a page from free-list using `kalloc()` and maps it to kernel page table at the Virtual Address (VA) calculated using `KSTACK(i)`.
+
+When the kernel boots, the kstacks for all the `NPROC` processes are initialized in the kernel page table. `procinit()` initializes the kstack pointers for all `NPROC` processes using `KSTACK(i)`, which is a fixed formula to compute the kstack address via the process index `i`. The actual kstack allocation for each process is done in  `proc_mapstacks()`, which allocates a page from free-list using `kalloc()` and maps it to kernel page table at the Virtual Address (VA) calculated using `KSTACK(i)`.
 
 ### Kernel Virtual Address Space
 
@@ -128,7 +136,7 @@ MAXVA
 +-------------------------------+
 0x0000000000000000
 ```
-The xv6 kernel maintains a single global page table that is shared by all processes and threads. At the lower end of the virtual address space, device memory regions such as UART0, VIRTIO, and the PLIC are mapped at fixed addresses. Beginning at `KERNBASE`, the kernel establishes an identity mapping of physical memory, where virtual addresses directly correspond to physical addresses.
+The xv6 kernel maintains a single global kernel page table that is shared by all processes. At the lower end of the virtual address space, device memory regions such as UART0, VIRTIO, and the PLIC are mapped at fixed addresses. Beginning at `KERNBASE`, the kernel establishes an identity mapping of physical memory, where virtual addresses directly correspond to physical addresses.
 The kernel stacks and trampoline page are exceptions and are mapped separately near `MAXVA`.
 
 The region from `KERNBASE` to `end` contains the kernel image, including the kernel's text, data, and BSS sections. The symbol `end` marks the first address immediately following the kernel image. All physical memory between `end` and `PHYSTOP` is initially free and is added to the kernel's page allocator during boot. This region serves as the source of physical pages used throughout the system for user memory, page tables, kernel data structures, and other dynamic allocations.
@@ -144,7 +152,7 @@ A context switch takes place, when the kernel calls `swtch(&P1->context, &P2->co
 
 
 ### Scheduler
-When a trap occurs, we enter the trap handler (`usertrap()`, `kerneltrap()`). If it is a timer interrupt, we call `yield()` to give up this process from this CPU. `yield()` calls `sched()`, which peforms the context switch between the current running process and the scheduler context via `swtch(&p->context, &mycpu()->context)`. After this, the scheduler process starts running from where it had left off in the `scheduler()` function, which is basically an infinite loop, inside which we use the scheduling algorithm to find the next process to run. Our xv6 supports two scheduling algorithms — Round Robin (RR) and Multi-Level Feedback Queue (MLFQ) — which can be switched between at runtime via a syscall. Once the next process to run in found (np), we change its state to `RUNNING` and switch to its execution using `swtch(&cpu->context, &np->context)`. Now the new process (np) is running on the CPU.
+When a trap occurs, we enter the trap handler (`usertrap()`, `kerneltrap()`). If it is a timer interrupt, we call `yield()` to give up this process from this CPU. `yield()` calls `sched()`, which peforms the context switch between the current running process and the scheduler context via `swtch(&p->context, &mycpu()->context)`. After this, the scheduler process starts running from where it had left off in the `scheduler()` function, which is basically an infinite loop, inside which we use the scheduling algorithm to find the next process to run. Our xv6 supports two scheduling algorithms — Round Robin (RR) and Multi-Level Feedback Queue (MLFQ) — which can be switched between at runtime via a syscall. Once the next process to run is found (np), we change its state to `RUNNING` and switch to its execution using `swtch(&cpu->context, &np->context)`. Now the new process (np) is running on the CPU.
 
 ### Process Trapframe - `struct trapframe`
 Contains the complete CPU register state of a process in user mode. It is saved when a trap, interrupt, or system call transfers control to the kernel, and restored when the process returns to user mode, allowing execution to resume exactly where it left off.
@@ -219,11 +227,11 @@ struct spinlock thread_list_lock;
 struct thread *init_thread;
 
 ```
-The new `struct thread` contains only the per-thread state required for scheduling, trap handling, and lifecycle management. Unlike the original `struct proc`, it does not contain resources that are shared across all threads in a thread family, such as the address space, open file table, current working directory etc. These shared fields have been moved to a separate shared data structure, to which the `family` field is a pointer to. This is described in more detail in the next section.
+The new `struct thread` contains only the per-thread state required for scheduling, trap handling, and lifecycle management. Unlike the original `struct proc`, it does not contain resources that are shared across all threads in a thread family, such as the address space, open file table, current working directory etc. These shared fields have been moved to a separate shared data structure, to which the `family` field is a pointer to. This is described in more detail in the [shared family structure](#2-new-thread-family-shared-data-structure) subsection.
 
-`slot_index` is the index that this thread's slot has occupied in the `slot_tracking` array (covered in detail in the subsection 2). It has an uninitialized value of `-1`.
+`slot_index` is the index that this thread's slot has occupied in the `slot_tracking` array (covered in detail in the subsection 2[shared family structure](#2-new-thread-family-shared-data-structure) subsection). It has an uninitialized value of `-1`.
 
-`kstack_index` is the index that this thread's kernel stack has occupied in the global `kstack_tracking` array (covered in detail in the subsection 6). It has an uninitialized value of `-1`.
+`kstack_index` is the index that this thread's kernel stack has occupied in the global `kstack_tracking` array (covered in detail in the [per-thread slot handling](#6-per-thread-slot-handling-with-per-thread-slot-tracking-array) subsection). It has an uninitialized value of `-1`.
 
 Note that we have removed the `parent` field which was present in the `struct proc`. Thats because all threads belonging to a family will be sibling threads.
 
@@ -231,10 +239,9 @@ The structure is protected by a **spin lock** rather than a sleep lock. The sche
 
 
 Earlier we had a fixed array as the PCB, but now we move to a **Linked List** for the Thread Control Block (TCB). We choose this approach as this allows us to dynamically allocate threads without any strict upper bound imposed by the list. The downside is that to the traversing to a specific thread takes `O(n)` time (vs `O(1)` in earlier approach via array index). But this is fine as the scheduler loops over all the threads anyway.
-
 The `next` field is a pointer to the next node in the TCB. 
 
-`init_thread` is the head of the Linked List and also the first thread created in the system by `userinit()`. It is great as a head as it will never exit.
+`init_thread` is the head of the Linked List and also the first thread created in the system by `userinit()`. It is works as the head as it will never exit.
 
 `thread_list_lock` is a global lock for this list's structure. Hence, when we loop over the list or add or remove threads, we need to acquire this lock. On the other hand, the per-thread lock in `thread` is used when modifying the thread itself. To avoid deadlocks, you acquire the `thread_list_lock` first and then find the thread, then acquire a lock on the thread, release `thread_list_lock`, make the changes you want on the thread and then release the lock on the thread.
 
@@ -270,27 +277,27 @@ struct family_thread_shared *init_family;
 ```
 The new `struct thread_family_shared` contains the fields common to a thread family such as the address space via the page table, the heap size (i.e. the top of the heap), the list of open files, the inode pointer to the current working directory and the list of VMAs, needed to lazy load the ELF segments of the program.
 
-[**NOTE:** The sleep lock should be held wherever any kind of page table access needs to be made. So the existing page table access need to be modified to hold the lock.]
+[**NOTE:** The sleep lock should be held wherever any kind of page table access needs to be made. So the *existing page table access need to be modified to hold the lock.*]
 
 Each thread in the same family have their `family` pointer pointing to the same `struct thread_family_shared` object.
 
 `parent_family` is a pointer to the family of the parent thread that spawned this family.
 
-`fid` is unique identifier for the family. It acts as the `PID` for user programs.
+`fid` is unique identifier for the family. It acts as the PID for user programs.
 
-The `slot_tracking` array is a boolean array. If `slot_tracking[slot_index] == 1` then the thread slot at index `slot_index` is occupied, else it is unoccupied. This array is useful when assigning a **thread slot** memory region to a new thread. For a given thread's slot index, we can derive formulas for calculating the address of the thread slot's base, the top of the user stack and the base of the trapframe. These formulas are mentioned in the **Virtual Memory Layout** subsection coming up next.
+The `slot_tracking` array is a boolean array. If `slot_tracking[slot_index] == 1` then the thread slot at index `slot_index` is occupied, else it is unoccupied. This array is useful when assigning a **thread slot** memory region to a new thread. For a given thread's slot index, we can derive formulas for calculating the address of the thread slot's base, the top of the user stack and the base of the trapframe. These formulas are mentioned in the [New Virtual Memory Layout](#user-mode-virtual-address-space-memory-layout) subsection coming up next.
 
 `NFAMILY_THREADS` is the absolute maximum number of threads that you can create in a single thread family. Its limited by the size of the **User Virtual Address Space** as it can accommodate only a limited number of thread slots.
 
-`heap_reserve` is the boundary beyond which thread slots can't be allocated. This will be explained in more detail in the New Memory Layout subsection
+`heap_reserve` is the boundary beyond which thread slots can't be allocated. This will be explained in more detail in the [New Virtual Memory Layout](#user-mode-virtual-address-space-memory-layout) subsection.
 
-The `no_clone` boolean flag, basically doesn't allow for a thread to be cloned (i.e. another thread to be created) if it is True. We need to turn off cloning especillay when we call `exec()` and kill off all the other family threads, and don't want any new threads created and also in `exit()` when we want to kill all the threads in the family and hence don't want any new threads to be created.
+The `no_clone` boolean flag, basically doesn't allow for a thread to be cloned (i.e. another thread to be created) if it is True. We need to turn off cloning especially when we call `exec()` and kill off all the other family threads, and don't want any new threads created and also in `exit()` when we want to kill all the threads in the family and hence don't want any new threads to be created.
 
 The `tcount` field keeps count of the number of threads alive in this family.
 
 Similar to the TCB, we also use a Linked List to store the Family Control Block (FCB).
 
-The `next` field is a pointer to the next family in FCB. `init_family` (`init_thread->family` = `init_family`) is used as a head of this list as it never exits.
+The `next` field is a pointer to the next family in FCB. `init_family`, which is allocated in `userinit()` as the family of `init_thread` (`init_thread->family` = `init_family`), is used as a head of this list as it never exits.
 
 We use a **sleep lock** (`sleeplk`) to protect the shared thread-family state of `pagetable`, `ofile`, `cwd` and `vmas`. Operations on shared resources such as the page table, open file table, current working directory, and VMAs may involve acquiring inode locks, waiting for disk I/O or other actions that can cause the calling thread to sleep. A spin lock is unsuitable here because xv6 disables interrupts while a spinlock is held. If a thread holding a spinlock goes to sleep waiting for an event that depends on an interrupt (such as disk I/O completion), the interrupt cannot be delivered, resulting in a deadlock. A sleep lock avoids this issue by allowing the thread to block and yield the CPU while waiting for the resource to become available.
 
@@ -366,7 +373,7 @@ ustack_top(i)   = slot_base(i) + 2*PGSIZE   // initial SP value
 trapframe_base(i) = slot_base(i) + 2*PGSIZE   // start of trapframe page
 ```
 
-In our notation, `slot_base` is the **bottom** of the guard-page, `ustack_top` is the **top** of the user stack  and `trapframe_base` is the **bottom** of the trapframe. `ustack_top` and `trapframe_base` evaluate to the same address. This is the boundary between the stack page and the trapframe page. From the stack's perspective it is the initial SP value; from the trapframe's perspective it is the start of the trapframe page. The allocation of the thread slot is covered in the next section.
+In our notation, `slot_base` is the **bottom** of the guard-page, `ustack_top` is the **top** of the user stack  and `trapframe_base` is the **bottom** of the trapframe. `ustack_top` and `trapframe_base` evaluate to the same address. This is the boundary between the stack page and the trapframe page. From the stack's perspective it is the initial SP value; from the trapframe's perspective it is the start of the trapframe page. The allocation of the thread slot is covered in the [slot allocation](#6-per-thread-slot-handling-with-per-thread-slot-tracking-array) subsection.
 
 The heap starts with one page and grows upward via `sbrk()` while thread stack allocation progresses downward, both regions compete for the same free address space. A naïve allocation strategy would allow thread creation to consume all available free space, potentially preventing future heap growth. To avoid this situation, the design introduces a reservation boundary, `HEAP_RESERVE`, within the free address space. New thread stacks may only be allocated above this boundary, ensuring that a portion of the address space remains available for future heap expansion.
 
@@ -379,16 +386,16 @@ heap_reserve = initial_sz + (HEAP_RESERVE_PAGES * PGSIZE)
 This approach provides a simple and predictable balance between thread creation and dynamic memory allocation. By reserving address space for future heap growth, the design prevents excessive thread creation from starving the heap while still allowing unused reserved space to be utilized by the heap when required.
 
 
-### 4. Modified Trap Handling for Per-thread Trapframes
+### 4. Modified Trap Handling with Per-thread Trapframes
 
-As mentioned in the [User Trap handling subsection](#user-trap-handler---usertrap), earlier we used to only have one trapframe per process and thus the trapframe address was hardcoded in **trampoline.S**
+As mentioned in the [User Trap handling](#user-trap-handler---usertrap) subsection, earlier we used to only have one trapframe per process and thus the trapframe address was hardcoded in **trampoline.S**
 
 But now, multiple thread's share the same address space and each thread needs its own trapframe to store its kernel execution state.
 Hence, we now need to find a way to make the **trampoline.S** aware of where the thread's trapframe is located. 
 
-To do this, we first need to get the `trapframe_base` address, using the formula specified in [New Memory Layout section](#3-new-memory-layout).
+To do this, we first need to get the `trapframe_base` address, using the formula specified in [New Memory Layout](#3-new-memory-layout) subsection.
 
-Now we need to get the thread's trapframe base VA into sscratch. For this we will need to add two functions - 
+Now we need to get the thread's trapframe base VA into *sscratch* register. For this we will need to add two functions - 
 ```c
 static inline void w_sscratch(uint64 x) {
   asm volatile("csrw sscratch, %0" : : "r" (x));
@@ -401,13 +408,14 @@ static inline uint64 r_sscratch() {
 }
 ```
 
-Then we modify the `prepare_return()` (earlier `usertrapret()`) to accesses the current thread via `mythread()` and uses `td->slot_index` with the `trapframe_base()` formula to compute the correct trapframe VA before writing it to sscratch with `w_sscratch(trapframe_base)`.
+Then we modify the `prepare_return()` (earlier `usertrapret()`) to accesses the current thread via `mythread()` and uses `td->slot_index` with the `trapframe_base()` formula to compute the correct trapframe VA before writing it to *sscratch* with `w_sscratch(trapframe_base)`.
 
 Lastly, in **trampoline.S** we swap these 2 lines  -  
-   1. `csrw sscratch, a0` - load the value of register a0 into register sscratch, so that we don't lose the value in a0.
-   2. `li a0, TRAPFRAME` - loads the hardcoded trapframe address into register a0
-with this -  
-`csrrw a0, sscratch, a0` - which does an atomic swap between the values of register a0 and register sscratch.  
+   1. `csrw sscratch, a0` - load the value of *register a0* into *register sscratch*, so that we don't lose the value in a0.
+   2. `li a0, TRAPFRAME` - loads the hardcoded trapframe address into *register a0*  
+
+with this line -  
+`csrrw a0, sscratch, a0` - which does an atomic swap between the values of *register a0* and *register sscratch*.  
 
 After the instruction is executed, a0 now has the trapframe VA and sscratch has the earlier a0's value. From here on out, the trampoline can function just as it did.
 
@@ -418,36 +426,36 @@ After the instruction is executed, a0 now has the trapframe VA and sscratch has 
 ### 5. Thread Lifecycle
 
 #### Birth:
-The first thread is created by `userinit()` and is saved as a global variable as `init_thread` which has a `TID = 1`. `init_thread` will always be the only thread in its family.
+The first thread is created by `userinit()` and is saved as a global variable as `init_thread` which has a `TID = 1`. `init_thread` will always be the only thread in its family (`init_family`).
 
 A new thread is created in the family by calling the function `clone()`. It internally calls `alloc_thread()` by passing the calling thread's family to it. `alloc_thread()` initializes a new thread object and also allocates a new thread slot (`alloc_slot()`) and a kernel stack (`alloc_kstack()`). `clone()` also sets up the program counter with a function pointer, from where the thread can start executing.  
 So from this, you might have noticed that the `clone()` can only create a thread in the same family.
 
-To create a thread with another family, we call `fork()`. The family created by `fork()` is the child of the calling thread's family and thus the calling thread's family is the parent family. The design of parent-child relation being between families rather than threads is important for other mechanisms. `fork()` calls `alloc_family()` internally and then also calls `alloc_thread()` with the newly created family. `fork()` will use `uvmcopy_thread()` to selectively copy just the calling thread's slot and other necessary resources, rather than copying full address space as the calling thread's address space also has slots of other sibling threads.
+To create a thread with another family, we call `fork()`. It creates a new family, which is the child of the calling thread's family and thus the calling thread's family is the parent family. The design of parent-child relation being between families rather than threads is important for other mechanisms. `fork()` calls `alloc_family()` internally and then also calls `alloc_thread()` with the newly created family. `fork()` will use `uvmcopy_thread()` to selectively copy just the calling thread's slot and other necessary resources, rather than copying full address space as the calling thread's address space also has slots of other sibling threads.
 
 `exec()` is used to override the the current family's running program with another one. When a thread calls `exec()`, it marks all the other threads in the family as `killed = 1` and waits for them to exit using `join()`. After all the other family threads have exited, then the address space is replaced.
 
 #### Death
-A thread can call `exit_thread()` to delete itself or can call `kill_thread(tid)` to delete a family thread with `TID = tid`. 
+A thread can call `exit_thread()` to delete itself or can call `kill_thread(tid)` to delete a sibling thread with `TID = tid`. 
 
 When a thread calls `kill_thread(tid)`, it sets `killed = 1` for the target thread. When this thread hits a trap and calls `usertrap()`, it calls `exit_thread()` as its `killed` flag is set. 
 
-In `exit_thread()`, it decrements the thread count of the family. If the thread count of the calling thread's family is 0, i.e. this is the last thread in the family, then it cleans up all of the external resources of the family and calls `reparent()` to reparent all of its children families to `init_thread`'s family and lastly wakes up a thread in the parent family sleeping on the parent family's channel.  
+In `exit_thread()`, it decrements the thread count of the family. If the thread count of the calling thread's family is 0, i.e. this is the last thread in the family, then it cleans up all of the external resources of the family and calls `reparent()` to reparent all of its children families to `init_family` (`init_thread->family`) and lastly wakes up a thread in the parent family sleeping on the parent family's channel.  
 If this is not the last thread in the family, then we just wake up a sibling thread sleeping on the family's channel.
 In both the above mentioned cases, we awaken a different thread (either a sibling thread or parent family's thread), so that it can clean up the remaining resources of the exited process.  
 It then changes the state of the thread to `ZOMBIE` and then jumps into the scheduler.  
 
-`exit()` is used to delete the full family. Internally, it calls `kill_thread()` on each thread in the family. 
+`exit()` is used to delete its own entire family. Internally, it calls `kill_thread()` on each thread in the family. 
 
-`kill(fid)` is used to delete full family with passed `FID`. Internally, it calls `kill_thread()` for each thread in the target family.
+`kill(fid)` is used to delete some other full family with passed `FID`. Internally, it calls `kill_thread()` for each thread in the target family.
 
 
-There are two waiting mechanisms - `wait()` and `join()` -
+There are two waiting mechanisms - `wait()` and `join()`:
 
 In `wait()` the thread waits for all the threads in a child family to exit. It has a infinite loop, inside which it loops over the children families to find one with no active threads i.e. `tcount == 0`. If it finds one, it calls `free_thread()` on each thread still in `ZOMBIE` state and then calls `free_family()` and return the freed family's `FID`.
 If it doesn't find one, it sleeps on a channel of its family, so that it is awoken by a child family's last thread exiting, to go over the loop to clear all resources.
 
-In `join()` the thread waits for a thread in the family to `exit()`. It has a infinite loop, inside which it loops over the sibling threads to find in `ZOMBIE` state. If it finds one, it calls calls `free_thread()` on it and return the freed thread's `TID`.
+In `join()` the thread waits for a sibling thread to `exit()`. It has a infinite loop, inside which it loops over the sibling threads to find one in `ZOMBIE` state. If it finds one, it calls calls `free_thread()` on it and return the freed thread's `TID`.
 If it doesn't find one, it sleeps on a channel of its family, so that it is awoken by a sibling thread exiting, to go over the loop to clear all resources.
 
 `free_thread()` internally calls `free_slot()` and `free_kstack()` to free the thread's slot and kernel stack respectively.
@@ -455,7 +463,7 @@ If it doesn't find one, it sleeps on a channel of its family, so that it is awok
 
 
 ### 6. Per-thread Slot handling with Per-thread Slot Tracking array 
-The  `clone()` function needs to assign a user stack succesfully to create a new thread. It will call the function whos definition is given below.  `td` is the a pointer to the thread for whom we are allocating a slot. The function will return `0` on success and `-1` on failure.
+The  `clone()` function needs to assign a user stack and trapframe succesfully to create a new thread. It will call the function whose definition is given below.  `td` is the a pointer to the thread for whom we are allocating a slot. The function will return `0` on success and `-1` on failure.
 ```c
 int alloc_slot(struct thread *td)
 ```
@@ -466,37 +474,37 @@ The `alloc_slot()` function will follow these steps:
    1. Acquire the `spinlk` lock on the `family`. 
    2. Find an empty stack slot by looping over `slot_tracking` and finding first index where `slot_tracking[index] == 0`. Lets call this index `slotIdx`. 
    3. Release the lock. 
-   4. If `slotIdx` is found, mark `slot_tracking[slotIdx] = 1`. Else, then go to **Step 10**
+   4. If `slotIdx` is found, mark `slot_tracking[slotIdx] = 1`. Else, then go to **Step 9**
 3. Mark slot index - `td->slot_index = slotIdx;`
-4. Find the `ustack_top` and `trapframe_base` addresses using the above given formula.
+4. Find the `ustack_top` and `trapframe_base` addresses using the formula given in [New Memory Layout](#3-new-memory-layout) subsection.
 5. Make sure the slot is not overlapping with the heap and it is above the `heap_reserve`.  
    ```c
     slot_base > family->sz && slot_base > family->heap_reserve
    ```
-   If this condition is not true, go to **Step 10**
+   If this condition is not true, go to **Step 9**
 6. Allocate the user stack by doing the following:
-   1.  Get a page of memory by calling `kalloc()`. If it fails, then go to **Step 10**.
+   1.  Get a page of memory by calling `kalloc()`. If it fails, then go to **Step 9**.
    2.  Acquire the sleep lock on `family`
-   3.  Map the page from `ustack_top - PGSIZE` address using `mappages()`. If `mappages()` fails, release the lock and go to **Step 10**.
+   3.  Map the page from `ustack_top - PGSIZE` address using `mappages()`. If `mappages()` fails, release the lock and go to **Step 9**.
    4.  Keep the guard page unmapped, so that it can catch any stack overflows. 
    5.  Release the lock.
-   6.  Return `0` for success.
+   6.  Assign stack pointer - `td->trapframe->sp = ustack_top`
 7. Allocate the trapframe by doing the following:
-   1.  Get a page of memory by calling `kalloc()`. If it fails, then go to **Step 10**.
+   1.  Get a page of memory by calling `kalloc()`. If it fails, then go to **Step 9**.
    2.  Acquire the sleep lock on `family`
-   3.  Map the page from `trapframe_base` address using `mappages()`. If `mappages()` fails, release the lock and go to **Step 10**.
-   4.  Assign the trapframe base to the thread - `td->trapframe = trapframe_base;`
-   5.  Release the lock.
-8. Assign stack pointer - `td->trapframe->sp = ustack_top`
-9.  Return `0` for success.
-10. This is the **clean up** step, in case of failure. 
-   1. Free the stack page, if allocated. 
-   2. Free the trapframe page, if allocated.
-   3. If user stack `mappages()` succeeded before failure, then we need to acquire the sleep lock on `family` and unmap the `ustack` page from the page table using `uvmunmap()` and then release the lock
-   4. If traprame `mappages()` succeeded before failure, then we need to acquire the sleep lock on `family` and unmap the `trapframe` page from the page table using `uvmunmap()` and then release the lock
-   5. If the `slot_tracking[slotIdx]` is marked, then we acquire the spin lock on `family`, and then we unmark it as `slot_tracking[slotIdx] = 0`.  Now, we release the lock.
-   6. If `td->slot_index` is marked, then we unmark it - `td->slot_index = -1`
-   7. Return `-1` for failure.
+   3.  Map the page from `trapframe_base` address using `mappages()`. If `mappages()` fails, release the lock and go to **Step 9**.
+   4.  Release the lock.
+   5.  Assign the trapframe base to the thread - `td->trapframe = trapframe_base;`
+8.  Return `0` for success.
+9.  This is the **clean up** step, in case of failure:
+       1. Free the stack page, if allocated. 
+       2. Free the trapframe page, if allocated.
+       3. If user stack `mappages()` succeeded before failure, then we need to acquire the sleep lock on `family` and unmap the `ustack` page from the page table using `uvmunmap()` and then release the lock
+       4. If traprame `mappages()` succeeded before failure, then we need to acquire the sleep lock on `family` and unmap the `trapframe` page from the page table using `uvmunmap()` and then release the lock
+       5. If the `slot_tracking[slotIdx]` is marked, then we acquire the spin lock on `family`, and then we unmark it as `slot_tracking[slotIdx] = 0`.  Now, we release the lock.
+       6. If `td->slot_index` is marked, then we unmark it - `td->slot_index = -1`
+       7. Return `-1` for failure.
+   
 
 Also, the slot needs to be freed on thread exit.
 ```c
@@ -507,11 +515,9 @@ For this we follow these steps:
 2. Acquire the sleep lock on `family` 
 3. Unmap the stack page from page table, and free the stack page, using `uvmunmap()`.
 4. Unmap the trapframe page from page table, and free the stack page, using `uvmunmap()`.
-5. Release the lock.
-6. Acquire the spin lock on the thread's `family` struct.
-7. Mark the slot memory region as free as such - `slot_tracking[td->slot_index] = 0;`.
-8. Release the lock
-9. Unmark the slot index - `td->slot_index = -1;`.
+5. Mark the slot memory region as free as such - `slot_tracking[td->slot_index] = 0;`.
+6. Release the lock.
+7. Unmark the slot index - `td->slot_index = -1;`.
 
 
 ### 7. Per-thread Kernel Stack handling with Global Kernel Stack Tracking array 
