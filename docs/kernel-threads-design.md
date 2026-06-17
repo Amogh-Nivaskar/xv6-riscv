@@ -696,12 +696,7 @@ This is achieved by doing the following:
    1. If failure is after *Step 1*, free the memory allocated for family - `kfree(family)`.
    2. If failure is after *Step 2*, free up the page table, trampoline and heap - `thread_freepagetable(family->pagetable, family->sz);`. 
 
-
-[**NOTE 1:** `thread_pagetable()` function creates and returns a pointer to the pagetable and also maps the trampoline page. It is derived from the older `proc_pagetable()` function.]
-
-[**NOTE 2:** `thread_freepagetable()` function frees the page table and trampoline and heap pages and unmaps them. It is derived from the older `proc_freepagetable()` function.]
-
-[**NOTE 3:** We don't initialize the rest of the shared family fields as `exec()` is expected to be called before the thread starts executing user code.]
+[**NOTE:** We don't initialize the rest of the shared family fields as `exec()` is expected to be called before the thread starts executing user code.]
 
 
 ```c
@@ -710,13 +705,18 @@ void free_family(struct thread_family_shared *family)
 This function frees the family object. 
 
 This is achieved by doing the following:
-1. Acquire the family spin lock `spinlk`.
-2. If `family->tcount > 0`, then release the lock and return.
-3. Release the lock.
-4. Acquire the family sleep lock `sleeplk`.
-5. Free up the page table, trampoline and heap - `thread_freepagetable(family->pagetable, family->sz);`
-6. Release the lock.
-7. Remove the family's node from FCB by doing the following:
+1. Panic if it is the `init_family`.
+   ```c
+   if (family == init_family)
+      panic("free_family: attempting to free init_family");
+   ```
+2. Acquire the family spin lock `spinlk`.
+3. If `family->tcount > 0`, then release the lock and return.
+4. Release the lock.
+5. Acquire the family sleep lock `sleeplk`.
+6. Free up the page table, trampoline and heap - `thread_freepagetable(family->pagetable, family->sz);`
+7. Release the lock.
+8. Remove the family's node from FCB by doing the following:
    1. Acquire FCB lock - `aquire(family_list_lock);`
    2. Loop over the TCB to find the family's node (`target`) and also the node just before it (`prev_target`):
       ```c
@@ -738,7 +738,7 @@ This is achieved by doing the following:
       prev_target->next = target->next;
       ``` 
    4. Release the lock.
-8. Free up the family memory - `kfree(family)`.
+9. Free up the family memory - `kfree(family)`.
 
 
 
@@ -752,7 +752,7 @@ It creates a new thread and runs the function `fn` with arguments `arg`.
 To achieve this, it does the following:
 1. Access calling thread's family - `struct thread_family_shared *family = mythread()->family;`
 2. Check if cloning is allowed:
-   1. Acquire spink lock `spinlk` on family
+   1. Acquire spin lock `spinlk` on family
    2. If `family->no_clone == 1`, release lock and return -1
    3. Release lock
 3. Create a thread object - `struct thread *td = NULL`.
@@ -814,7 +814,7 @@ It achieves this by doing the following:
 1. Access calling thread - `struct thread *td = mythread()`
 2. Access calling thread's family - `struct thread_family_shared *family = td->family;`
 3. Turn off cloning:
-   1. Acquire the spin lock no the family
+   1. Acquire the spin lock on the family
    2. Turn off cloning - `family->no_clone = 1`
    3. Store siblings count - `int siblings = family->tcount - 1`
    4. Release lock
@@ -970,13 +970,20 @@ Right now, `uvm_copy()` only copies the memory starting from 0 to `sz`. We exten
 int uvmcopy(pagetable_t old, pagetable_t new, uint64 start, uint64 sz)
 ```
 
+#### 8. Derived `thread_pagetable()`
+It creates a new pagetable and maps the trampoline page to it and then returns its pointer.  
+It is derived from the earlier `proc_pagetable()` function.
 
-#### 8. Modified Scheduler
+#### 9. Derived `thread_freepagetable()`
+It unmaps the trampoline and heap pages, and frees their pages along with the pagetable's page.  
+It is derived from the earlier `proc_freepagetable()` function.
+
+#### 10. Modified Scheduler
 The scheduler algorithm decides which one of the `RUNNABLE` threads gets to execute next on the CPU. 
 
 Now instead of looping over the PCB, the scheduler loops over the TCB with the acquired global thread list lock to find the next thread to execute and acquires the per-thread lock to change the state of the thread. We then release the global lock before `swtch()`. The per-thread lock is held across `swtch()` and released by the newly scheduled thread after the context switch — consistent with vanilla xv6.
 
-### 9. Modified `userinit()`
+### 11. Modified `userinit()`
 It sets up the first thread (`init_thread`) and its family (`init_family`).
 
 Global variables `init_thread` and `init_family` are originally `NULL` initialized.
