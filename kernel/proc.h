@@ -1,5 +1,8 @@
+#include "sleeplock.h"
+
 // Saved registers for kernel context switches.
-struct context {
+struct context
+{
   uint64 ra;
   uint64 sp;
 
@@ -19,15 +22,15 @@ struct context {
 };
 
 // Per-CPU state.
-struct cpu {
-  struct proc *proc;          // The process running on this cpu, or null.
-  struct context context;     // swtch() here to enter scheduler().
-  int noff;                   // Depth of push_off() nesting.
-  int intena;                 // Were interrupts enabled before push_off()?
+struct cpu
+{
+  struct proc *proc;      // The process running on this cpu, or null.
+  struct context context; // swtch() here to enter scheduler().
+  int noff;               // Depth of push_off() nesting.
+  int intena;             // Were interrupts enabled before push_off()?
 };
 
 extern struct cpu cpus[NCPU];
-
 
 // per-process data for the trap handling code in trampoline.S.
 // sits in a page by itself just under the trampoline page in the
@@ -41,7 +44,8 @@ extern struct cpu cpus[NCPU];
 // the trapframe includes callee-saved user registers like s0-s11 because the
 // return-to-user path via usertrapret() doesn't return through
 // the entire kernel call stack.
-struct trapframe {
+struct trapframe
+{
   /*   0 */ uint64 kernel_satp;   // kernel page table
   /*   8 */ uint64 kernel_sp;     // top of process's kernel stack
   /*  16 */ uint64 kernel_trap;   // usertrap()
@@ -80,9 +84,18 @@ struct trapframe {
   /* 280 */ uint64 t6;
 };
 
-enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
+enum procstate
+{
+  UNUSED,
+  USED,
+  SLEEPING,
+  RUNNABLE,
+  RUNNING,
+  ZOMBIE
+};
 
-struct vma {
+struct vma
+{
   struct inode *inode;
   uint64 vaddr;
   uint64 off;
@@ -92,18 +105,19 @@ struct vma {
 };
 
 // Per-process state
-struct proc {
+struct proc
+{
   struct spinlock lock;
 
   // p->lock must be held when using these:
-  enum procstate state;        // Process state
-  void *chan;                  // If non-zero, sleeping on chan
-  int killed;                  // If non-zero, have been killed
-  int xstate;                  // Exit status to be returned to parent's wait
-  int pid;                     // Process ID
+  enum procstate state; // Process state
+  void *chan;           // If non-zero, sleeping on chan
+  int killed;           // If non-zero, have been killed
+  int xstate;           // Exit status to be returned to parent's wait
+  int pid;              // Process ID
 
   // wait_lock must be held when using this:
-  struct proc *parent;         // Parent process
+  struct proc *parent; // Parent process
 
   // these are private to the process, so p->lock need not be held.
   uint64 kstack;               // Virtual address of kernel stack
@@ -116,8 +130,8 @@ struct proc {
   char name[16];               // Process name (debugging)
 
   // Scheduling fields
-  int priority;                 // current queue level
-  int cpu_time;                 // ticks accumulated at current level
+  int priority; // current queue level
+  int cpu_time; // ticks accumulated at current level
 
   // Observatory fields
   int total_wait_time;
@@ -133,3 +147,68 @@ struct proc {
 extern struct proc proc[NPROC];
 
 extern int scheduler_type;
+
+// ---------------------------------------------------------THREADS-------------------------------------
+
+struct thread
+{
+  struct spinlock lock;
+
+  enum procstate state;
+  void *chan;
+  int killed;
+  int xstate;
+  int tid;
+
+  int kstack_index;
+  int slot_index;
+  struct trapframe *trapframe;
+  struct context context;
+
+  struct thread_family_shared *family;
+  struct thread *next;
+
+  char name[16];
+
+  // Scheduling fields
+  int priority; // current queue level
+  int cpu_time; // ticks accumulated at current level
+
+  // Observatory fields
+  int total_wait_time;
+  int runs_count;
+  int first_runnable_tick;
+  int last_runnable_tick;
+  int first_run_tick;
+  int exit_tick;
+};
+
+extern struct spinlock thread_list_lock;
+
+extern struct thread *init_thread;
+
+struct thread_family_shared
+{
+  struct sleeplock sleeplk;
+  struct spinlock spinlk;
+
+  pagetable_t pagetable;
+  uint64 sz;
+
+  struct file *ofile[NOFILE];
+  struct inode *cwd;
+  struct vma vmas[NVMA];
+
+  struct thread_family_shared *parent_family;
+  struct thread_family_shared *next;
+  int fid;
+
+  int tcount;
+  int no_clone;
+  int slot_tracking[NFAMILY_THREADS];
+  uint64 heap_reserve;
+};
+
+extern struct spinlock family_list_lock;
+
+extern struct thread_family_shared *init_family;

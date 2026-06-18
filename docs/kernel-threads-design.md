@@ -989,7 +989,7 @@ The scheduler algorithm decides which one of the `RUNNABLE` threads gets to exec
 
 Now instead of looping over the PCB, the scheduler loops over the TCB with the acquired global thread list lock to find the next thread to execute and acquires the per-thread lock to change the state of the thread. We then release the global lock before `swtch()`. The per-thread lock is held across `swtch()` and released by the newly scheduled thread after the context switch — consistent with vanilla xv6.
 
-### 11. Modified `userinit()`
+#### 11. Modified `userinit()`
 It sets up the first thread (`init_thread`) and its family (`init_family`).
 
 Global variables `init_thread` and `init_family` are originally `NULL` initialized.
