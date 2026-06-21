@@ -15,13 +15,13 @@ sys_exit(void)
   int n;
   argint(0, &n);
   kexit(n);
-  return 0;  // not reached
+  return 0; // not reached
 }
 
 uint64
 sys_getpid(void)
 {
-  return myproc()->pid;
+  return mythread()->tid;
 }
 
 uint64
@@ -47,21 +47,25 @@ sys_sbrk(void)
 
   argint(0, &n);
   argint(1, &t);
-  addr = myproc()->sz;
+  addr = mythread()->family->sz;
 
-  if(t == SBRK_EAGER || n < 0) {
-    if(growproc(n) < 0) {
+  if (t == SBRK_EAGER || n < 0)
+  {
+    if (growproc(n) < 0)
+    {
       return -1;
     }
-  } else {
+  }
+  else
+  {
     // Lazily allocate memory for this process: increase its memory
     // size but don't allocate memory. If the processes uses the
     // memory, vmfault() will allocate it.
-    if(addr + n < addr)
+    if (addr + n < addr)
       return -1;
-    if(addr + n > TRAPFRAME)
+    if (addr + n > TRAPFRAME)
       return -1;
-    myproc()->sz += n;
+    mythread()->family->sz += n;
   }
   return addr;
 }
@@ -73,12 +77,14 @@ sys_pause(void)
   uint ticks0;
 
   argint(0, &n);
-  if(n < 0)
+  if (n < 0)
     n = 0;
   acquire(&tickslock);
   ticks0 = ticks;
-  while(ticks - ticks0 < n){
-    if(killed(myproc())){
+  while (ticks - ticks0 < n)
+  {
+    if (killed(mythread()))
+    {
       release(&tickslock);
       return -1;
     }
@@ -111,37 +117,44 @@ sys_uptime(void)
 }
 
 uint64
-sys_hello(void){
+sys_hello(void)
+{
   printf("Hello from kernel!\n");
   return 0;
 }
 
 uint64
-sys_getproccount(void){
+sys_getproccount(void)
+{
   int count = 0;
-  struct proc *p;
-  
-  for(p = proc; p < &proc[NPROC]; p++){
-	if (p->state != UNUSED){
-		count++;
-	}
+  struct thread* p;
+
+  for (p = threads; p < &threads[NPROC]; p++)
+  {
+    if (p->state != UNUSED)
+    {
+      count++;
+    }
   }
 
   return count;
 }
 
 uint64
-sys_getprocinfo(void){
+sys_getprocinfo(void)
+{
   uint64 st;
   struct procinfo pi;
-  struct proc *p;
+  struct thread* p;
   int count = 0;
 
   argaddr(0, &st);
-  for (p = proc; p < &proc[NPROC]; p++){
+  for (p = threads; p < &threads[NPROC]; p++)
+  {
     acquire(&p->lock);
-    if (p->state != UNUSED){
-      pi.entries[count].pid = p->pid;
+    if (p->state != UNUSED)
+    {
+      pi.entries[count].pid = p->tid;
       pi.entries[count].cpu_time = p->cpu_time;
       pi.entries[count].priority = p->priority;
       pi.entries[count].state = p->state;
@@ -155,13 +168,14 @@ sys_getprocinfo(void){
       count++;
     }
     release(&p->lock);
-  } 
+  }
   pi.count = count;
-  return copyout(myproc()->pagetable, st, (char*)&pi, sizeof(pi));
+  return copyout(mythread()->family->pagetable, st, (char*)&pi, sizeof(pi));
 }
 
 uint64
-sys_settracer(void){
+sys_settracer(void)
+{
   extern int tracer_enabled;
   int value;
   argint(0, &value);
@@ -169,14 +183,16 @@ sys_settracer(void){
   return 0;
 }
 
-uint64 sys_sleep(void){
+uint64 sys_sleep(void)
+{
   extern uint ticks;
   int duration;
   argint(0, &duration);
-  
+
   acquire(&tickslock);
   int start_tick = ticks;
-  while (ticks - start_tick < duration){
+  while (ticks - start_tick < duration)
+  {
     sleep(&ticks, &tickslock);
   }
   release(&tickslock);
@@ -184,13 +200,15 @@ uint64 sys_sleep(void){
   return 0;
 };
 
-uint64 sys_setscheduler(void){
+uint64 sys_setscheduler(void)
+{
   int mode;
   argint(0, &mode);
 
-  if (mode < 0 || mode >= SCHED_COUNT){
+  if (mode < 0 || mode >= SCHED_COUNT)
+  {
     return -1;
-  }    
+  }
 
   scheduler_type = mode;
   return 0;
