@@ -137,8 +137,6 @@ struct thread
   int last_runnable_tick;
   int first_run_tick;
   int exit_tick;
-
-  uint64 kstack;
 };
 
 extern struct spinlock thread_list_lock;

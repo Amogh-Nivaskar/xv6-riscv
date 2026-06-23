@@ -12,6 +12,7 @@
  * the kernel's page table.
  */
 pagetable_t kernel_pagetable;
+struct spinlock kpgtbl_lock;
 
 extern char etext[]; // kernel.ld sets this to end of kernel code.
 
@@ -45,9 +46,6 @@ kvmmake(void)
   // the highest virtual address in the kernel.
   kvmmap(kpgtbl, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
 
-  // allocate and map a kernel stack for each process.
-  proc_mapstacks(kpgtbl);
-
   return kpgtbl;
 }
 
@@ -56,13 +54,44 @@ kvmmake(void)
 // does not flush TLB or enable paging.
 void kvmmap(pagetable_t kpgtbl, uint64 va, uint64 pa, uint64 sz, int perm)
 {
+  acquire(&kpgtbl_lock);
   if (mappages(kpgtbl, va, sz, pa, perm) != 0)
     panic("kvmmap");
+  release(&kpgtbl_lock);
+  sfence_vma();
+}
+
+void kvmunmap(pagetable_t kpgtbl, uint64 va, uint64 npages, int do_free)
+{
+  uint64 a;
+  pte_t *pte;
+
+  if ((va % PGSIZE) != 0)
+    panic("uvmunmap: not aligned");
+
+  acquire(&kpgtbl_lock);
+  for (a = va; a < va + npages * PGSIZE; a += PGSIZE)
+  {
+    if ((pte = walk(kpgtbl, a, 0)) == 0) // leaf page table entry allocated?
+      continue;
+    if ((*pte & PTE_V) == 0) // has physical page been allocated?
+      continue;
+    if (do_free)
+    {
+      uint64 pa = PTE2PA(*pte);
+      kfree((void *)pa);
+    }
+    *pte = 0;
+  }
+  release(&kpgtbl_lock);
+  sfence_vma();
 }
 
 // Initialize the kernel_pagetable, shared by all CPUs.
 void kvminit(void)
 {
+  initlock(&kpgtbl_lock, "kpgtbl_lock");
+
   kernel_pagetable = kvmmake();
 }
 

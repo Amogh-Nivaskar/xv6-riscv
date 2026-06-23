@@ -167,7 +167,7 @@ usertrap(void)
 //
 void prepare_return(void)
 {
-  struct thread *p = mythread();
+  struct thread *t = mythread();
 
   // we're about to switch the destination of traps from
   // kerneltrap() to usertrap(). because a trap from kernel
@@ -180,10 +180,10 @@ void prepare_return(void)
 
   // set up trapframe values that uservec will need when
   // the process next traps into the kernel.
-  p->trapframe->kernel_satp = r_satp();         // kernel page table
-  p->trapframe->kernel_sp = p->kstack + PGSIZE; // process's kernel stack
-  p->trapframe->kernel_trap = (uint64)usertrap;
-  p->trapframe->kernel_hartid = r_tp(); // hartid for cpuid()
+  t->trapframe->kernel_satp = r_satp();                            // kernel page table
+  t->trapframe->kernel_sp = KSTACK_BASE(t->kstack_index) + PGSIZE; // process's kernel stack
+  t->trapframe->kernel_trap = (uint64)usertrap;
+  t->trapframe->kernel_hartid = r_tp(); // hartid for cpuid()
 
   // set up the registers that trampoline.S's sret will use
   // to get to user space.
@@ -195,7 +195,7 @@ void prepare_return(void)
   w_sstatus(x);
 
   // set S Exception Program Counter to the saved user pc.
-  w_sepc(p->trapframe->epc);
+  w_sepc(t->trapframe->epc);
 }
 
 // interrupts and exceptions from kernel code go here via kernelvec,
