@@ -9,10 +9,6 @@
 
 struct cpu cpus[NCPU];
 
-struct thread threads[NPROC];
-
-struct thread_family_shared families[NPROC];
-
 struct thread *init_thread;
 struct thread_family_shared *init_family;
 
@@ -38,6 +34,8 @@ extern char trampoline[]; // trampoline.S
 
 extern uint ticks;
 
+int family_count = 0;
+
 // helps ensure that wakeups of wait()ing
 // parents are not lost. helps obey the
 // memory model when using p->parent.
@@ -47,26 +45,12 @@ struct spinlock wait_lock;
 // initialize the proc table.
 void procinit(void)
 {
-  struct thread *t;
-  struct thread_family_shared *f;
-
   initlock(&tid_lock, "nexttid");
   initlock(&fid_lock, "nextfid");
   initlock(&wait_lock, "wait_lock");
   initlock(&kstack_tracking_lock, "kstack_tracking_lock");
-
-  for (t = threads; t < &threads[NPROC]; t++)
-  {
-    initlock(&t->lock, "thread");
-    t->state = UNUSED;
-  }
-  for (f = families; f < &families[NPROC]; f++)
-  {
-    initlock(&f->spinlk, "family");
-    initsleeplock(&f->sleeplk, "family");
-    f->fid = 0;
-    f->tcount = 0;
-  }
+  initlock(&thread_list_lock, "thread_list_lock");
+  initlock(&family_list_lock, "family_list_lock");
 }
 
 // Must be called with interrupts disabled,
@@ -194,26 +178,18 @@ void free_kstack(struct thread *t)
 // If found, initialize state required to run in the kernel,
 // and return with p->lock held.
 // If there are no free procs, or a memory allocation fails, return 0.
-static struct thread *
-alloc_thread(void)
+struct thread *alloc_thread()
 {
   struct thread *t;
 
-  for (t = threads; t < &threads[NPROC]; t++)
+  if ((t = (struct thread *)kalloc()) == 0)
   {
-    acquire(&t->lock);
-    if (t->state == UNUSED)
-    {
-      goto found;
-    }
-    else
-    {
-      release(&t->lock);
-    }
+    return NULL;
   }
-  return 0;
+  memset(t, 0, sizeof(*t));
 
-found:
+  initlock(&t->lock, "thread");
+
   t->tid = alloctid();
   t->state = USED;
   t->kstack_index = -1;
@@ -222,17 +198,30 @@ found:
   // Allocate a trapframe page.
   if ((t->trapframe = (struct trapframe *)kalloc()) == 0)
   {
-    free_thread(t);
-    release(&t->lock);
-    return 0;
+    kfree(t);
+    return NULL;
   }
 
   if (alloc_kstack(t) == -1)
   {
-    free_thread(t);
-    release(&t->lock);
-    return 0;
+    kfree(t->trapframe);
+    kfree(t);
+    return NULL;
   }
+
+  t->next = NULL;
+
+  acquire(&thread_list_lock);
+  if (init_thread == NULL)
+  {
+    init_thread = t;
+  }
+  else
+  {
+    t->next = init_thread->next;
+    init_thread->next = t;
+  }
+  release(&thread_list_lock);
 
   // Set up new context to start executing at forkret,
   // which returns to user space.
@@ -250,38 +239,61 @@ found:
   return t;
 }
 
-static struct thread_family_shared *
-alloc_family(struct thread *td)
+struct thread_family_shared *alloc_family(struct thread *td)
 {
   struct thread_family_shared *f;
 
-  for (f = families; f < &families[NPROC]; f++)
+  if ((f = (struct thread_family_shared *)kalloc()) == 0)
   {
-    acquire(&f->spinlk);
-    if (f->tcount == 0)
-    {
-      goto found;
-    }
-    else
-    {
-      release(&f->spinlk);
-    }
+    return NULL;
   }
-  return 0;
+  memset(f, 0, sizeof(*f));
 
-found:
+  initlock(&f->spinlk, "family");
+  initsleeplock(&f->sleeplk, "family");
+
   f->fid = allocfid();
   f->tcount = 1;
+
+  // This should ideally be done in alloc_thread() but is removed as user stack allocation needs thread created before family
+  td->family = f;
 
   // An empty user page table.
   f->pagetable = proc_pagetable(td);
   if (f->pagetable == 0)
   {
-    free_family(f);
-    release(&f->spinlk);
-    return 0;
+    td->family = NULL;
+    kfree(f);
+    return NULL;
   }
 
+  f->next = NULL;
+
+  acquire(&family_list_lock);
+
+  if (family_count >= NFAMILIES)
+  {
+    proc_freepagetable(f->pagetable, f->sz);
+    kfree(f);
+    td->family = NULL;
+    release(&family_list_lock);
+    return NULL;
+  }
+  else
+  {
+    family_count++;
+  }
+
+  if (init_family == NULL)
+  {
+    init_family = f;
+  }
+  else
+  {
+    f->next = init_family->next;
+    init_family->next = f;
+  }
+  release(&family_list_lock);
   return f;
 }
 
@@ -291,33 +303,47 @@ found:
 static void
 free_thread(struct thread *t)
 {
+  if (t == init_thread)
+    panic("free_thread: attempting to free init_thread");
+
   if (t->trapframe)
     kfree((void *)t->trapframe);
 
   if (t->kstack_index != -1)
     free_kstack(t);
 
-  t->trapframe = 0;
-  t->tid = 0;
-  t->name[0] = 0;
-  t->chan = 0;
-  t->killed = 0;
-  t->xstate = 0;
-  t->state = UNUSED;
+  acquire(&thread_list_lock);
+  struct thread *target = init_thread->next;
+  struct thread *prev_target = init_thread;
+
+  while (target != NULL)
+  {
+    if (target->tid == t->tid)
+      break;
+    target = target->next;
+    prev_target = prev_target->next;
+  }
+
+  if (target == NULL)
+  {
+    panic("Thread node not found in TCB");
+  }
+  prev_target->next = target->next;
+  release(&thread_list_lock);
+
+  kfree(target);
 }
 
 static void
 free_family(struct thread_family_shared *f)
 {
+  if (f == init_family)
+    panic("free_family: attempting to free init_family");
 
   if (f->pagetable)
     proc_freepagetable(f->pagetable, f->sz);
-  f->pagetable = 0;
-  f->sz = 0;
-  f->fid = 0;
-  f->tcount = 0;
-  f->parent_family = NULL;
 
+  acquiresleep(&f->sleeplk);
   for (int i = 0; i < NVMA; i++)
   {
     struct vma v = f->vmas[i];
@@ -327,6 +353,30 @@ free_family(struct thread_family_shared *f)
     }
   }
   memset(f->vmas, 0, sizeof(f->vmas));
+  releasesleep(&f->sleeplk);
+
+  acquire(&family_list_lock);
+  struct thread_family_shared *target = init_family->next;
+  struct thread_family_shared *prev_target = init_family;
+
+  while (target != NULL)
+  {
+    if (target->fid == f->fid)
+      break;
+    target = target->next;
+    prev_target = prev_target->next;
+  }
+
+  if (target == NULL)
+  {
+    panic("Family node not found in FCB");
+  }
+  prev_target->next = target->next;
+
+  family_count--;
+  release(&family_list_lock);
+
+  kfree(target);
 }
 
 // Create a user page table for a given process, with no user memory,
@@ -339,7 +389,9 @@ proc_pagetable(struct thread *p)
   // An empty page table.
   pagetable = uvmcreate();
   if (pagetable == 0)
+  {
     return 0;
+  }
 
   // map the trampoline code (for system call return)
   // at the highest user virtual address.
@@ -361,7 +413,6 @@ proc_pagetable(struct thread *p)
     uvmfree(pagetable, 0);
     return 0;
   }
-
   return pagetable;
 }
 
@@ -377,23 +428,27 @@ void proc_freepagetable(pagetable_t pagetable, uint64 sz)
 // Set up first user process.
 void userinit(void)
 {
-  struct thread *t;
-  struct thread_family_shared *f;
 
-  t = alloc_thread();
-  f = alloc_family(t);
-  t->family = f;
+  if ((init_thread = alloc_thread()) == NULL)
+  {
+    panic("userinit: no page for init_thread");
+  }
 
-  init_thread = t;
-  init_family = f;
+  if ((init_family = alloc_family(init_thread)) == NULL)
+  {
+    panic("userinit: no page for init_family");
+  }
 
-  t->family->cwd = namei("/");
+  acquire(&init_family->spinlk);
+  init_family->cwd = namei("/");
+  release(&init_family->spinlk);
 
-  t->state = RUNNABLE;
-  t->first_runnable_tick = ticks;
-  t->last_runnable_tick = ticks;
-  release(&f->spinlk);
-  release(&t->lock);
+  acquire(&init_thread->lock);
+  init_thread->family = init_family;
+  init_thread->state = RUNNABLE;
+  init_thread->first_runnable_tick = ticks;
+  init_thread->last_runnable_tick = ticks;
+  release(&init_thread->lock);
 }
 
 // Grow or shrink user memory by n bytes.
@@ -432,26 +487,22 @@ int kfork(void)
   struct thread_family_shared *nf;
   struct thread *t = mythread();
 
-  // Allocate process.
-  if ((nt = alloc_thread()) == 0)
+  if ((nt = alloc_thread()) == NULL)
   {
     return -1;
   }
 
-  if ((nf = alloc_family(nt)) == 0)
+  if ((nf = alloc_family(nt)) == NULL)
   {
+    free_thread(nt);
     return -1;
   }
-
-  nt->family = nf;
 
   // Copy user memory from parent to child.
   if (uvmcopy(t->family->pagetable, nf->pagetable, t->family->sz) < 0)
   {
     free_thread(nt);
     free_family(nf);
-    release(&nt->lock);
-    release(&nf->spinlk);
     return -1;
   }
   nt->family->sz = t->family->sz;
@@ -483,9 +534,6 @@ int kfork(void)
     }
   }
 
-  release(&nt->lock);
-  release(&nf->spinlk);
-
   acquire(&wait_lock);
   nt->family->parent_family = t->family;
   release(&wait_lock);
@@ -506,7 +554,8 @@ void reparent(struct thread_family_shared *f)
 {
   struct thread_family_shared *ff;
 
-  for (ff = families; ff < &families[NPROC]; ff++)
+  acquire(&family_list_lock);
+  for (ff = init_family; ff != NULL; ff = ff->next)
   {
     if (ff->parent_family == f)
     {
@@ -514,6 +563,7 @@ void reparent(struct thread_family_shared *f)
       wakeup(init_family);
     }
   }
+  release(&family_list_lock);
 }
 
 // Exit the current process.  Does not return.
@@ -577,9 +627,10 @@ int kwait(uint64 addr)
   {
     // Scan through table looking for exited children.
     havekids = 0;
-    for (tt = threads; tt < &threads[NPROC]; tt++)
+    acquire(&thread_list_lock);
+    for (tt = init_thread; tt != NULL; tt = tt->next)
     {
-      if (tt->state != UNUSED && tt->family->parent_family == t->family)
+      if (tt->state != UNUSED && tt->family != NULL && tt->family->parent_family == t->family)
       {
         // make sure the child isn't still in exit() or swtch().
         acquire(&tt->lock);
@@ -589,22 +640,29 @@ int kwait(uint64 addr)
         {
           // Found one.
           fid = tt->family->fid;
+          struct thread_family_shared *zombie_family = tt->family;
           if (addr != 0 && copyout(t->family->pagetable, addr, (char *)&tt->xstate,
                                    sizeof(tt->xstate)) < 0)
           {
             release(&tt->lock);
+            release(&thread_list_lock);
             release(&wait_lock);
             return -1;
           }
-          free_family(tt->family);
-          free_thread(tt);
+          // Release both locks before free calls: free_family -> wakeup and
+          // free_thread both try to acquire thread_list_lock.
+          // wait_lock is still held so no concurrent kwait can race on this zombie.
           release(&tt->lock);
+          release(&thread_list_lock);
+          free_family(zombie_family);
+          free_thread(tt);
           release(&wait_lock);
           return fid;
         }
         release(&tt->lock);
       }
     }
+    release(&thread_list_lock);
 
     // No point waiting if we don't have any children.
     if (!havekids || killed(t))
@@ -630,8 +688,8 @@ struct sched_state cpu_sched_state[NCPU];
 
 void sched_rr(struct cpu *c)
 {
-
-  for (struct thread *t = threads; t < &threads[NPROC]; t++)
+  acquire(&thread_list_lock);
+  for (struct thread *t = init_thread; t != NULL; t = t->next)
   {
     acquire(&t->lock);
     if (t->state == RUNNABLE)
@@ -644,11 +702,15 @@ void sched_rr(struct cpu *c)
       c->thread = t;
 
       sfence_vma();
+      release(&thread_list_lock);
       swtch(&c->context, &t->context);
       c->thread = 0;
+      release(&t->lock);
+      return;
     }
     release(&t->lock);
   }
+  release(&thread_list_lock);
 }
 
 void sched_mlfq(struct cpu *c)
@@ -663,7 +725,8 @@ void sched_mlfq(struct cpu *c)
   }
 
   int found = 0;
-  for (struct thread *t = threads; t < &threads[NPROC]; t++)
+  acquire(&thread_list_lock);
+  for (struct thread *t = init_thread; t != NULL; t = t->next)
   {
     acquire(&t->lock);
     if (boost_now == 1 && t->state != UNUSED)
@@ -684,10 +747,15 @@ void sched_mlfq(struct cpu *c)
     if (t->state == RUNNABLE &&
         (ss->chosen_proc == NULL || ss->chosen_proc->priority > t->priority))
     {
+      if (ss->chosen_proc != NULL)
+        release(&ss->chosen_proc->lock);
       ss->chosen_proc = t;
       found = 1;
     }
-    release(&t->lock);
+    else
+    {
+      release(&t->lock);
+    }
   }
 
   if (boost_now == 1)
@@ -698,36 +766,36 @@ void sched_mlfq(struct cpu *c)
 
   if (found == 1)
   {
-    acquire(&ss->chosen_proc->lock);
-    if (ss->chosen_proc->state == RUNNABLE)
-    {
-      // Switch to chosen process.  It is the process's job
-      // to release its lock and then reacquire it
-      // before jumping back to us.
-      ss->chosen_proc->state = RUNNING;
 
-      // Observability calculations
-      if (ss->chosen_proc->first_run_tick == -1)
-        ss->chosen_proc->first_run_tick = ticks;
+    // Switch to chosen process.  It is the process's job
+    // to release its lock and then reacquire it
+    // before jumping back to us.
+    ss->chosen_proc->state = RUNNING;
 
-      int wait_time = ticks - ss->chosen_proc->last_runnable_tick;
-      ss->chosen_proc->total_wait_time += wait_time;
-      ss->chosen_proc->runs_count += 1;
+    // Observability calculations
+    if (ss->chosen_proc->first_run_tick == -1)
+      ss->chosen_proc->first_run_tick = ticks;
 
-      c->thread = ss->chosen_proc;
+    int wait_time = ticks - ss->chosen_proc->last_runnable_tick;
+    ss->chosen_proc->total_wait_time += wait_time;
+    ss->chosen_proc->runs_count += 1;
 
-      sfence_vma();
-      swtch(&c->context, &ss->chosen_proc->context);
+    c->thread = ss->chosen_proc;
 
-      // Process is done running for now.
-      // It should have changed its p->state before coming back.
-      c->thread = 0;
-    }
-    release(&ss->chosen_proc->lock);
+    sfence_vma();
+    release(&thread_list_lock);
+    swtch(&c->context, &ss->chosen_proc->context);
+
+    // Process is done running for now.
+    // It should have changed its p->state before coming back.
+    c->thread = 0;
+    struct thread *chosen = ss->chosen_proc;
     ss->chosen_proc = NULL;
+    release(&chosen->lock);
   }
   else
   {
+    release(&thread_list_lock);
     // nothing to run; stop running on this core until an interrupt.
     asm volatile("wfi");
   }
@@ -869,9 +937,8 @@ void sleep(void *chan, struct spinlock *lk)
 // Caller should hold the condition lock.
 void wakeup(void *chan)
 {
-  struct thread *t;
-
-  for (t = threads; t < &threads[NPROC]; t++)
+  acquire(&thread_list_lock);
+  for (struct thread *t = init_thread; t != NULL; t = t->next)
   {
     if (t != mythread())
     {
@@ -884,6 +951,7 @@ void wakeup(void *chan)
       release(&t->lock);
     }
   }
+  release(&thread_list_lock);
 }
 
 // Kill the process with the given pid.
@@ -891,9 +959,8 @@ void wakeup(void *chan)
 // to user space (see usertrap() in trap.c).
 int kkill(int tid)
 {
-  struct thread *t;
-
-  for (t = threads; t < &threads[NPROC]; t++)
+  acquire(&thread_list_lock);
+  for (struct thread *t = init_thread; t != NULL; t = t->next)
   {
     acquire(&t->lock);
     if (t->tid == tid)
@@ -906,10 +973,12 @@ int kkill(int tid)
         t->last_runnable_tick = ticks;
       }
       release(&t->lock);
+      release(&thread_list_lock);
       return 0;
     }
     release(&t->lock);
   }
+  release(&thread_list_lock);
   return -1;
 }
 
@@ -976,19 +1045,21 @@ void procdump(void)
       [RUNNABLE] "runble",
       [RUNNING] "run   ",
       [ZOMBIE] "zombie"};
-  struct thread *p;
+  struct thread *t;
   char *state;
 
   printf("\n");
-  for (p = threads; p < &threads[NPROC]; p++)
+  acquire(&thread_list_lock);
+  for (t = init_thread; t != NULL; t = t->next)
   {
-    if (p->state == UNUSED)
+    if (t->state == UNUSED)
       continue;
-    if (p->state >= 0 && p->state < NELEM(states) && states[p->state])
-      state = states[p->state];
+    if (t->state >= 0 && t->state < NELEM(states) && states[t->state])
+      state = states[t->state];
     else
       state = "???";
-    printf("%d %s %s", p->tid, state, p->name);
+    printf("%d %s %s", t->tid, state, t->name);
     printf("\n");
   }
+  release(&thread_list_lock);
 }

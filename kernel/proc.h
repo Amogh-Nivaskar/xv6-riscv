@@ -169,8 +169,4 @@ extern struct spinlock family_list_lock;
 
 extern struct thread_family_shared *init_family;
 
-extern struct thread threads[NPROC];
-
-extern struct thread_family_shared families[NPROC];
-
 extern int scheduler_type;

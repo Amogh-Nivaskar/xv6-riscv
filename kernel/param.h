@@ -21,6 +21,7 @@
 #define NTHREADS 5000
 #define HEAP_RESERVE_PAGES 4
 #define NFAMILY_THREADS 100
+#define NFAMILIES 64
 
 enum SchedType
 {

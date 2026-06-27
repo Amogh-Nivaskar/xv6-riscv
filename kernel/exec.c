@@ -33,7 +33,7 @@ int kexec(char *path, char **argv)
   struct proghdr ph;
   pagetable_t pagetable = 0, oldpagetable;
   struct vma vmas[NVMA] = {0};
-  struct thread *p = mythread();
+  struct thread *t = mythread();
   int nvma = 0;
 
   begin_op();
@@ -54,7 +54,7 @@ int kexec(char *path, char **argv)
   if (elf.magic != ELF_MAGIC)
     goto bad;
 
-  if ((pagetable = proc_pagetable(p)) == 0)
+  if ((pagetable = proc_pagetable(t)) == 0)
     goto bad;
 
   // Load program into memory.
@@ -89,7 +89,7 @@ int kexec(char *path, char **argv)
   end_op();
   ip = 0;
 
-  uint64 oldsz = p->family->sz;
+  uint64 oldsz = t->family->sz;
 
   // Allocate some pages at the next page boundary.
   // Make the first inaccessible as a stack guard.
@@ -130,30 +130,30 @@ int kexec(char *path, char **argv)
   // a0 and a1 contain arguments to user main(argc, argv)
   // argc is returned via the system call return
   // value, which goes in a0.
-  p->trapframe->a1 = sp;
+  t->trapframe->a1 = sp;
 
   // Save program name for debugging.
   for (last = s = path; *s; s++)
     if (*s == '/')
       last = s + 1;
-  safestrcpy(p->name, last, sizeof(p->name));
+  safestrcpy(t->name, last, sizeof(t->name));
 
   for (int j = 0; j < NVMA; j++)
   {
-    if (p->family->vmas[j].inode != 0)
+    if (t->family->vmas[j].inode != 0)
     {
-      iput(p->family->vmas[j].inode);
-      p->family->vmas[j].inode = 0;
+      iput(t->family->vmas[j].inode);
+      t->family->vmas[j].inode = 0;
     }
   }
 
   // Commit to the user image.
-  oldpagetable = p->family->pagetable;
-  p->family->pagetable = pagetable;
-  memmove(p->family->vmas, vmas, sizeof(vmas));
-  p->family->sz = sz;
-  p->trapframe->epc = elf.entry; // initial program counter = ulib.c:start()
-  p->trapframe->sp = sp;         // initial stack pointer
+  oldpagetable = t->family->pagetable;
+  t->family->pagetable = pagetable;
+  memmove(t->family->vmas, vmas, sizeof(vmas));
+  t->family->sz = sz;
+  t->trapframe->epc = elf.entry; // initial program counter = ulib.c:start()
+  t->trapframe->sp = sp;         // initial stack pointer
   proc_freepagetable(oldpagetable, oldsz);
 
   return argc; // this ends up in a0, the first argument to main(argc, argv)

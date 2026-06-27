@@ -127,15 +127,17 @@ uint64
 sys_getproccount(void)
 {
   int count = 0;
-  struct thread* p;
+  struct thread *t;
 
-  for (p = threads; p < &threads[NPROC]; p++)
+  acquire(&thread_list_lock);
+  for (t = init_thread; t != 0; t = t->next)
   {
-    if (p->state != UNUSED)
+    if (t->state != UNUSED)
     {
       count++;
     }
   }
+  release(&thread_list_lock);
 
   return count;
 }
@@ -145,32 +147,34 @@ sys_getprocinfo(void)
 {
   uint64 st;
   struct procinfo pi;
-  struct thread* p;
+  struct thread *t;
   int count = 0;
 
   argaddr(0, &st);
-  for (p = threads; p < &threads[NPROC]; p++)
+  acquire(&thread_list_lock);
+  for (t = init_thread; t != 0; t = t->next)
   {
-    acquire(&p->lock);
-    if (p->state != UNUSED)
+    acquire(&t->lock);
+    if (t->state != UNUSED)
     {
-      pi.entries[count].pid = p->tid;
-      pi.entries[count].cpu_time = p->cpu_time;
-      pi.entries[count].priority = p->priority;
-      pi.entries[count].state = p->state;
-      pi.entries[count].total_wait_time = p->total_wait_time;
-      pi.entries[count].runs_count = p->runs_count;
-      pi.entries[count].first_runnable_tick = p->first_runnable_tick;
-      pi.entries[count].last_runnable_tick = p->last_runnable_tick;
-      pi.entries[count].first_run_tick = p->first_run_tick;
-      pi.entries[count].exit_tick = p->exit_tick;
-      safestrcpy(pi.entries[count].name, p->name, 16);
+      pi.entries[count].pid = t->tid;
+      pi.entries[count].cpu_time = t->cpu_time;
+      pi.entries[count].priority = t->priority;
+      pi.entries[count].state = t->state;
+      pi.entries[count].total_wait_time = t->total_wait_time;
+      pi.entries[count].runs_count = t->runs_count;
+      pi.entries[count].first_runnable_tick = t->first_runnable_tick;
+      pi.entries[count].last_runnable_tick = t->last_runnable_tick;
+      pi.entries[count].first_run_tick = t->first_run_tick;
+      pi.entries[count].exit_tick = t->exit_tick;
+      safestrcpy(pi.entries[count].name, t->name, 16);
       count++;
     }
-    release(&p->lock);
+    release(&t->lock);
   }
+  release(&thread_list_lock);
   pi.count = count;
-  return copyout(mythread()->family->pagetable, st, (char*)&pi, sizeof(pi));
+  return copyout(mythread()->family->pagetable, st, (char *)&pi, sizeof(pi));
 }
 
 uint64

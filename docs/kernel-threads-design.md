@@ -726,8 +726,8 @@ This is achieved by doing the following:
    1. Acquire FCB lock - `aquire(family_list_lock);`
    2. Loop over the TCB to find the family's node (`target`) and also the node just before it (`prev_target`):
       ```c
-      struct thread *target = init_thread->family->next;
-      struct thread *prev_target = init_thread->family;
+      struct thread_family_shared *target = init_family->next;
+      struct thread_family_shared *prev_target = init_family;
       
       while (target != NULL){
          if (target->fid == family.fid) break;
@@ -744,7 +744,7 @@ This is achieved by doing the following:
       prev_target->next = target->next;
       ``` 
    4. Release the lock.
-9. Free up the family memory - `kfree(family)`.
+9. Free up the family memory - `kfree(target)`.
 
 
 
