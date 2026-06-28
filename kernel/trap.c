@@ -174,6 +174,8 @@ void prepare_return(void)
   // code to usertrap would be a disaster, turn off interrupts.
   intr_off();
 
+  w_sscratch(TRAPFRAME_BASE(mythread()->slot_index));
+
   // send syscalls, interrupts, and exceptions to uservec in trampoline.S
   uint64 trampoline_uservec = TRAMPOLINE + (uservec - trampoline);
   w_stvec(trampoline_uservec);
