@@ -482,19 +482,19 @@ The `alloc_slot()` function will follow these steps:
     slot_base > family->sz && slot_base > family->heap_reserve
    ```
    If this condition is not true, go to **Step 9**
-6. Allocate the user stack by doing the following:
+6. Allocate the trapframe by doing the following:
+   1.  Get a page of memory by calling `kalloc()`. If it fails, then go to **Step 9**.
+   2.  Acquire the sleep lock on `family`
+   3.  Map the page from `trapframe_base` address using `mappages()`. If `mappages()` fails, release the lock and go to **Step 9**.
+   4.  Release the lock.
+   5.  Assign the trapframe base to the thread - `td->trapframe = trapframe_base;`
+7. Allocate the user stack by doing the following:
    1.  Get a page of memory by calling `kalloc()`. If it fails, then go to **Step 9**.
    2.  Acquire the sleep lock on `family`
    3.  Map the page from `ustack_top - PGSIZE` address using `mappages()`. If `mappages()` fails, release the lock and go to **Step 9**.
    4.  Keep the guard page unmapped, so that it can catch any stack overflows. 
    5.  Release the lock.
    6.  Assign stack pointer - `td->trapframe->sp = ustack_top`
-7. Allocate the trapframe by doing the following:
-   1.  Get a page of memory by calling `kalloc()`. If it fails, then go to **Step 9**.
-   2.  Acquire the sleep lock on `family`
-   3.  Map the page from `trapframe_base` address using `mappages()`. If `mappages()` fails, release the lock and go to **Step 9**.
-   4.  Release the lock.
-   5.  Assign the trapframe base to the thread - `td->trapframe = trapframe_base;`
 8.  Return `0` for success.
 9.  This is the **clean up** step, in case of failure:
        1. Free the stack page, if allocated. 

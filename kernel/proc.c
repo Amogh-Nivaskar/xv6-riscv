@@ -140,7 +140,7 @@ int alloc_kstack(struct thread *t)
 
   t->kstack_index = kstackIdx;
 
-  uint64 kstack_base = KSTACK_BASE(kstackIdx);
+  uint64 kstack_base = KSTACK_BASE(t->kstack_index);
   t->context.sp = kstack_base + PGSIZE;
 
   char *pa = kalloc();
@@ -174,11 +174,138 @@ void free_kstack(struct thread *t)
   t->context.sp = 0;
 }
 
+int alloc_slot(struct thread *t, pagetable_t pagetable)
+{
+  struct thread_family_shared *family = t->family;
+
+  int old_slotIdx = t->slot_index;
+  struct trapframe *old_trapframe = t->trapframe;
+
+  int new_slotIdx = -1;
+
+  acquire(&family->spinlk);
+  for (int i = 0; i < NFAMILY_THREADS; i++)
+  {
+    if (family->slot_tracking[i] == 0)
+    {
+      new_slotIdx = i;
+      break;
+    }
+  }
+
+  if (new_slotIdx == -1)
+  {
+    release(&family->spinlk);
+    goto err_no_empty_slot_index;
+  }
+
+  family->slot_tracking[new_slotIdx] = 1;
+
+  t->slot_index = new_slotIdx;
+
+  uint64 slot_base = SLOT_BASE(t->slot_index);
+  uint64 ustack_top = USTACK_TOP(t->slot_index);
+  uint64 trapframe_base = TRAPFRAME_BASE(t->slot_index);
+
+  if (slot_base <= family->sz || slot_base <= family->heap_reserve)
+  {
+    release(&family->spinlk);
+    goto err_slot_index_filled;
+  }
+
+  release(&family->spinlk);
+
+  char *trapframe_pa = kalloc();
+
+  if (trapframe_pa == 0)
+  {
+    goto err_slot_index_filled;
+  }
+
+  acquiresleep(&family->sleeplk);
+  if (mappages(pagetable, trapframe_base, PGSIZE,
+               (uint64)trapframe_pa, PTE_R | PTE_W) < 0)
+  {
+    releasesleep(&family->sleeplk);
+    goto err_trapframe_allocated;
+  }
+
+  releasesleep(&family->sleeplk);
+
+  t->trapframe = (struct trapframe *)trapframe_pa;
+
+  char *ustack_pa = kalloc();
+
+  if (ustack_pa == 0)
+  {
+    goto err_trapframe_mapped;
+  }
+
+  acquiresleep(&family->sleeplk);
+  if (mappages(pagetable, ustack_top - PGSIZE, PGSIZE,
+               (uint64)ustack_pa, PTE_R | PTE_W | PTE_U) < 0)
+  {
+    releasesleep(&family->sleeplk);
+    goto err_ustack_allocated;
+  }
+  releasesleep(&family->sleeplk);
+
+  t->trapframe->sp = ustack_top;
+
+  return 0;
+
+err_ustack_allocated:
+  kfree(ustack_pa);
+
+err_trapframe_mapped:
+  acquiresleep(&family->sleeplk);
+  uvmunmap(pagetable, trapframe_base, 1, 0);
+  releasesleep(&family->sleeplk);
+
+err_trapframe_allocated:
+  kfree(trapframe_pa);
+
+err_slot_index_filled:
+  acquire(&family->spinlk);
+  family->slot_tracking[t->slot_index] = 0;
+  release(&family->spinlk);
+  t->slot_index = old_slotIdx;
+  t->trapframe = old_trapframe;
+
+err_no_empty_slot_index:
+  return -1;
+}
+
+void free_slot(struct thread *t)
+{
+  acquiresleep(&t->family->sleeplk);
+  unmap_slot(t->slot_index, t->family->pagetable, 1);
+  t->family->slot_tracking[t->slot_index] = 0;
+  releasesleep(&t->family->sleeplk);
+
+  acquire(&t->lock);
+  t->slot_index = -1;
+  t->trapframe = NULL;
+  release(&t->lock);
+
+  return;
+}
+
+void unmap_slot(int slot_index, pagetable_t pagetable, int do_free)
+{
+  uint64 ustack_top = USTACK_TOP(slot_index);
+  uint64 trapframe_base = TRAPFRAME_BASE(slot_index);
+
+  uvmunmap(pagetable, ustack_top - PGSIZE, 1, do_free);
+
+  uvmunmap(pagetable, trapframe_base, 1, do_free);
+}
+
 // Look in the process table for an UNUSED proc.
 // If found, initialize state required to run in the kernel,
 // and return with p->lock held.
 // If there are no free procs, or a memory allocation fails, return 0.
-struct thread *alloc_thread()
+struct thread *alloc_thread(struct thread_family_shared *f)
 {
   struct thread *t;
 
@@ -194,9 +321,10 @@ struct thread *alloc_thread()
   t->state = USED;
   t->kstack_index = -1;
   t->slot_index = -1;
+  t->family = f;
 
-  // Allocate a trapframe page.
-  if ((t->trapframe = (struct trapframe *)kalloc()) == 0)
+  // Allocate a slot.
+  if (alloc_slot(t, t->family->pagetable) == -1)
   {
     kfree(t);
     return NULL;
@@ -204,7 +332,7 @@ struct thread *alloc_thread()
 
   if (alloc_kstack(t) == -1)
   {
-    kfree(t->trapframe);
+    free_slot(t);
     kfree(t);
     return NULL;
   }
@@ -239,7 +367,7 @@ struct thread *alloc_thread()
   return t;
 }
 
-struct thread_family_shared *alloc_family(struct thread *td)
+struct thread_family_shared *alloc_family()
 {
   struct thread_family_shared *f;
 
@@ -252,17 +380,12 @@ struct thread_family_shared *alloc_family(struct thread *td)
   initlock(&f->spinlk, "family");
   initsleeplock(&f->sleeplk, "family");
 
-  f->fid = allocfid();
   f->tcount = 1;
 
-  // This should ideally be done in alloc_thread() but is removed as user stack allocation needs thread created before family
-  td->family = f;
-
   // An empty user page table.
-  f->pagetable = proc_pagetable(td);
+  f->pagetable = family_pagetable();
   if (f->pagetable == 0)
   {
-    td->family = NULL;
     kfree(f);
     return NULL;
   }
@@ -273,9 +396,8 @@ struct thread_family_shared *alloc_family(struct thread *td)
 
   if (family_count >= NFAMILIES)
   {
-    proc_freepagetable(f->pagetable, f->sz);
+    family_freepagetable(f->pagetable, f->sz);
     kfree(f);
-    td->family = NULL;
     release(&family_list_lock);
     return NULL;
   }
@@ -283,6 +405,8 @@ struct thread_family_shared *alloc_family(struct thread *td)
   {
     family_count++;
   }
+
+  f->fid = allocfid();
 
   if (init_family == NULL)
   {
@@ -306,8 +430,8 @@ free_thread(struct thread *t)
   if (t == init_thread)
     panic("free_thread: attempting to free init_thread");
 
-  if (t->trapframe)
-    kfree((void *)t->trapframe);
+  if (t->slot_index != -1)
+    free_slot(t);
 
   if (t->kstack_index != -1)
     free_kstack(t);
@@ -341,7 +465,7 @@ free_family(struct thread_family_shared *f)
     panic("free_family: attempting to free init_family");
 
   if (f->pagetable)
-    proc_freepagetable(f->pagetable, f->sz);
+    family_freepagetable(f->pagetable, f->sz);
 
   acquiresleep(&f->sleeplk);
   for (int i = 0; i < NVMA; i++)
@@ -382,7 +506,7 @@ free_family(struct thread_family_shared *f)
 // Create a user page table for a given process, with no user memory,
 // but with trampoline and trapframe pages.
 pagetable_t
-proc_pagetable(struct thread *p)
+family_pagetable()
 {
   pagetable_t pagetable;
 
@@ -404,24 +528,14 @@ proc_pagetable(struct thread *p)
     return 0;
   }
 
-  // map the trapframe page just below the trampoline page, for
-  // trampoline.S.
-  if (mappages(pagetable, TRAPFRAME, PGSIZE,
-               (uint64)(p->trapframe), PTE_R | PTE_W) < 0)
-  {
-    uvmunmap(pagetable, TRAMPOLINE, 1, 0);
-    uvmfree(pagetable, 0);
-    return 0;
-  }
   return pagetable;
 }
 
 // Free a process's page table, and free the
 // physical memory it refers to.
-void proc_freepagetable(pagetable_t pagetable, uint64 sz)
+void family_freepagetable(pagetable_t pagetable, uint64 sz)
 {
   uvmunmap(pagetable, TRAMPOLINE, 1, 0);
-  uvmunmap(pagetable, TRAPFRAME, 1, 0);
   uvmfree(pagetable, sz);
 }
 
@@ -429,14 +543,14 @@ void proc_freepagetable(pagetable_t pagetable, uint64 sz)
 void userinit(void)
 {
 
-  if ((init_thread = alloc_thread()) == NULL)
-  {
-    panic("userinit: no page for init_thread");
-  }
-
-  if ((init_family = alloc_family(init_thread)) == NULL)
+  if ((init_family = alloc_family()) == NULL)
   {
     panic("userinit: no page for init_family");
+  }
+
+  if ((init_thread = alloc_thread(init_family)) == NULL)
+  {
+    panic("userinit: no page for init_thread");
   }
 
   acquire(&init_family->spinlk);
@@ -456,25 +570,40 @@ void userinit(void)
 int growproc(int n)
 {
   uint64 sz;
-  struct thread *p = mythread();
+  struct thread *t = mythread();
+  struct thread_family_shared *f = t->family;
 
-  sz = p->family->sz;
+  int last_slotIdx = -1;
+
+  acquire(&f->spinlk);
+  for (int i = 0; i < NFAMILY_THREADS; i++)
+  {
+    if (f->slot_tracking[i] == 1 && i > last_slotIdx)
+    {
+      last_slotIdx = i;
+    }
+  }
+  release(&f->spinlk);
+
+  uint64 last_slot_base = SLOT_BASE(last_slotIdx);
+
+  sz = t->family->sz;
   if (n > 0)
   {
-    if (sz + n > TRAPFRAME)
+    if (sz + n > last_slot_base)
     {
       return -1;
     }
-    if ((sz = uvmalloc(p->family->pagetable, sz, sz + n, PTE_W)) == 0)
+    if ((sz = uvmalloc(t->family->pagetable, sz, sz + n, PTE_W)) == 0)
     {
       return -1;
     }
   }
   else if (n < 0)
   {
-    sz = uvmdealloc(p->family->pagetable, sz, sz + n);
+    sz = uvmdealloc(t->family->pagetable, sz, sz + n);
   }
-  p->family->sz = sz;
+  t->family->sz = sz;
   return 0;
 }
 
@@ -487,24 +616,29 @@ int kfork(void)
   struct thread_family_shared *nf;
   struct thread *t = mythread();
 
-  if ((nt = alloc_thread()) == NULL)
+  if ((nf = alloc_family()) == NULL)
   {
     return -1;
   }
 
-  if ((nf = alloc_family(nt)) == NULL)
+  if ((nt = alloc_thread(nf)) == NULL)
   {
-    free_thread(nt);
+    free_family(nf);
     return -1;
   }
 
   // Copy user memory from parent to child.
-  if (uvmcopy(t->family->pagetable, nf->pagetable, t->family->sz) < 0)
+  if (uvmcopy(t->family->pagetable, nf->pagetable, 0, t->family->sz) < 0)
   {
     free_thread(nt);
     free_family(nf);
     return -1;
   }
+
+  uint64 dst_pa = walkaddr(nt->family->pagetable, USTACK_TOP(nt->slot_index) - PGSIZE);
+  uint64 src_pa = walkaddr(t->family->pagetable, USTACK_TOP(t->slot_index) - PGSIZE);
+  memmove((void *)dst_pa, (void *)src_pa, PGSIZE);
+
   nt->family->sz = t->family->sz;
 
   // copy saved user registers.
@@ -512,6 +646,9 @@ int kfork(void)
 
   // Cause fork to return 0 in the child.
   nt->trapframe->a0 = 0;
+
+  uint64 parent_used = USTACK_TOP(t->slot_index) - t->trapframe->sp;
+  nt->trapframe->sp = USTACK_TOP(nt->slot_index) - parent_used;
 
   // increment reference counts on open file descriptors.
   for (i = 0; i < NOFILE; i++)
@@ -654,8 +791,8 @@ int kwait(uint64 addr)
           // wait_lock is still held so no concurrent kwait can race on this zombie.
           release(&tt->lock);
           release(&thread_list_lock);
-          free_family(zombie_family);
           free_thread(tt);
+          free_family(zombie_family);
           release(&wait_lock);
           return fid;
         }
@@ -889,7 +1026,8 @@ void forkret(void)
 
     // We can invoke kexec() now that file system is initialized.
     // Put the return value (argc) of kexec into a0.
-    p->trapframe->a0 = kexec("/init", (char *[]){"/init", 0});
+    uint64 exec_result = kexec("/init", (char *[]){"/init", 0});
+    p->trapframe->a0 = exec_result;
     if (p->trapframe->a0 == -1)
     {
       panic("exec");
@@ -963,7 +1101,7 @@ int kkill(int tid)
   for (struct thread *t = init_thread; t != NULL; t = t->next)
   {
     acquire(&t->lock);
-    if (t->tid == tid)
+    if (t->family != NULL && t->family->fid == tid)
     {
       t->killed = 1;
       if (t->state == SLEEPING)

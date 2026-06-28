@@ -63,9 +63,18 @@ sys_sbrk(void)
     // memory, vmfault() will allocate it.
     if (addr + n < addr)
       return -1;
-    if (addr + n > TRAPFRAME)
+    struct thread_family_shared *f = mythread()->family;
+    int last_slotIdx = -1;
+    acquire(&f->spinlk);
+    for (int i = 0; i < NFAMILY_THREADS; i++)
+    {
+      if (f->slot_tracking[i] == 1 && i > last_slotIdx)
+        last_slotIdx = i;
+    }
+    release(&f->spinlk);
+    if (addr + n > SLOT_BASE(last_slotIdx))
       return -1;
-    mythread()->family->sz += n;
+    f->sz += n;
   }
   return addr;
 }

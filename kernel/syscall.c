@@ -11,8 +11,6 @@
 int fetchaddr(uint64 addr, uint64 *ip)
 {
   struct thread *p = mythread();
-  if (addr >= p->family->sz || addr + sizeof(uint64) > p->family->sz) // both tests needed, in case of overflow
-    return -1;
   if (copyin(p->family->pagetable, (char *)ip, addr, sizeof(*ip)) != 0)
     return -1;
   return 0;
@@ -178,8 +176,11 @@ void syscall(void)
   if (num > 0 && num < NELEM(syscalls) && syscalls[num])
   {
     // Use num to lookup the system call function for num, call it,
-    // and store its return value in p->trapframe->a0
-    p->trapframe->a0 = syscalls[num]();
+    // and store its return value in p->trapframe->a0.
+    // NOTE: exec() changes p->trapframe mid-call, so we must evaluate
+    // p->trapframe AFTER the call, not before.
+    uint64 retval = syscalls[num]();
+    p->trapframe->a0 = retval;
 
     char *result;
     if (p->trapframe->a0 < 0)

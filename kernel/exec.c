@@ -35,6 +35,8 @@ int kexec(char *path, char **argv)
   struct vma vmas[NVMA] = {0};
   struct thread *t = mythread();
   int nvma = 0;
+  int old_slotIdx = t->slot_index;
+  struct trapframe *old_trapframe = t->trapframe;
 
   begin_op();
 
@@ -54,7 +56,7 @@ int kexec(char *path, char **argv)
   if (elf.magic != ELF_MAGIC)
     goto bad;
 
-  if ((pagetable = proc_pagetable(t)) == 0)
+  if ((pagetable = family_pagetable()) == 0)
     goto bad;
 
   // Load program into memory.
@@ -91,16 +93,17 @@ int kexec(char *path, char **argv)
 
   uint64 oldsz = t->family->sz;
 
-  // Allocate some pages at the next page boundary.
-  // Make the first inaccessible as a stack guard.
-  // Use the rest as the user stack.
   sz = PGROUNDUP(sz);
-  uint64 sz1;
-  if ((sz1 = uvmalloc(pagetable, sz, sz + (USERSTACK + 1) * PGSIZE, PTE_W)) == 0)
+
+  t->family->slot_tracking[old_slotIdx] = 0;
+
+  if (alloc_slot(t, pagetable) == -1)
+  {
+    t->family->slot_tracking[old_slotIdx] = 1;
     goto bad;
-  sz = sz1;
-  uvmclear(pagetable, sz - (USERSTACK + 1) * PGSIZE);
-  sp = sz;
+  }
+
+  sp = USTACK_TOP(t->slot_index);
   stackbase = sp - USERSTACK * PGSIZE;
 
   // Copy argument strings into new stack, remember their
@@ -152,15 +155,25 @@ int kexec(char *path, char **argv)
   t->family->pagetable = pagetable;
   memmove(t->family->vmas, vmas, sizeof(vmas));
   t->family->sz = sz;
+  t->family->heap_reserve = sz + HEAP_RESERVE_PAGES * PGSIZE;
   t->trapframe->epc = elf.entry; // initial program counter = ulib.c:start()
   t->trapframe->sp = sp;         // initial stack pointer
-  proc_freepagetable(oldpagetable, oldsz);
+  unmap_slot(old_slotIdx, oldpagetable, 1);
+  family_freepagetable(oldpagetable, oldsz);
 
   return argc; // this ends up in a0, the first argument to main(argc, argv)
 
 bad:
+  if (t->trapframe != old_trapframe)
+  {
+    unmap_slot(t->slot_index, pagetable, 1);
+    t->slot_index = old_slotIdx;
+    t->trapframe = old_trapframe;
+  }
+
   if (pagetable)
-    proc_freepagetable(pagetable, sz);
+    family_freepagetable(pagetable, sz);
+
   if (ip)
   {
     for (int j = 0; j < NVMA; j++)

@@ -387,6 +387,7 @@ typedef uint64 *pagetable_t; // 512 PTEs
 // that have the high bit set.
 #define MAXVA (1L << (9 + 9 + 9 + 12 - 1))
 
+#ifndef __ASSEMBLER__
 static inline void w_sscratch(uint64 x)
 {
   asm volatile("csrw sscratch, %0" : : "r"(x));
@@ -398,3 +399,4 @@ static inline uint64 r_sscratch()
   asm volatile("csrr %0, sscratch" : "=r"(x));
   return x;
 }
+#endif // __ASSEMBLER__
