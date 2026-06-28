@@ -158,6 +158,7 @@ UPROGS=\
 	$U/_execbench\
 	$U/_noop\
 	$U/_noopwait\
+	$U/_threadtest\
 
 
 fs.img: mkfs/mkfs README $(UPROGS)

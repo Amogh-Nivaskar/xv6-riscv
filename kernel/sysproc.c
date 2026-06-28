@@ -226,3 +226,13 @@ uint64 sys_setscheduler(void)
   scheduler_type = mode;
   return 0;
 }
+
+uint64 sys_clone(void)
+{
+  uint64 f;
+  uint64 a;
+  argaddr(0, &f);
+  argaddr(1, &a);
+
+  return kclone(f, a);
+}

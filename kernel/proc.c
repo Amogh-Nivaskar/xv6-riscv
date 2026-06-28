@@ -685,6 +685,41 @@ int kfork(void)
   return fid;
 }
 
+uint64 kclone(uint64 fn, uint64 arg)
+{
+  struct thread *myt = mythread();
+  struct thread_family_shared *myf = myt->family;
+
+  acquire(&myf->spinlk);
+  if (myf->no_clone == 1)
+  {
+    release(&myf->spinlk);
+    return -1;
+  }
+  release(&myf->spinlk);
+
+  struct thread *nt;
+
+  if ((nt = alloc_thread(myf)) == NULL)
+  {
+    return -1;
+  }
+
+  nt->trapframe->epc = fn;
+  nt->trapframe->a0 = arg;
+
+  acquire(&myf->spinlk);
+  myf->tcount++;
+  release(&myf->spinlk);
+
+  acquire(&nt->lock);
+  nt->state = RUNNABLE;
+  int nt_tid = nt->tid;
+  release(&nt->lock);
+
+  return nt_tid;
+}
+
 // Pass p's abandoned children to init.
 // Caller must hold wait_lock.
 void reparent(struct thread_family_shared *f)
