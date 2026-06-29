@@ -44,24 +44,24 @@ usertrap(void)
   // since we're now in the kernel.
   w_stvec((uint64)kernelvec); // DOC: kernelvec
 
-  struct thread *p = mythread();
+  struct thread *t = mythread();
 
   // save user program counter.
-  p->trapframe->epc = r_sepc();
+  t->trapframe->epc = r_sepc();
 
   if (r_scause() == 8)
   {
     // system call
 
-    if (killed(p))
-      kexit(-1);
+    if (killed(t))
+      kexit_thread(-1);
 
     // sepc points to the ecall instruction,
     // but we want to return to the next instruction.
-    p->trapframe->epc += 4;
+    t->trapframe->epc += 4;
 
     // increase cpu_time to avoid gaming of schedular
-    p->cpu_time += 1;
+    t->cpu_time += 1;
 
     // an interrupt will change sepc, scause, and sstatus,
     // so enable only now that we're done with those registers.
@@ -77,10 +77,10 @@ usertrap(void)
   {
     uint64 va = r_stval();
     va = PGROUNDDOWN(va);
-    pagetable_t pt = p->family->pagetable;
+    pagetable_t pt = t->family->pagetable;
     if (va >= MAXVA)
     {
-      setkilled(p);
+      setkilled(t);
     }
     else
     {
@@ -88,8 +88,8 @@ usertrap(void)
 
       if (pte == 0 || ((*pte & PTE_V) == 0))
       {
-        if (vmfault(p->family->pagetable, va, 0) == 0)
-          setkilled(p);
+        if (vmfault(t->family->pagetable, va, 0) == 0)
+          setkilled(t);
       }
       else if ((*pte & PTE_COW) && (*pte & PTE_U))
       {
@@ -106,7 +106,7 @@ usertrap(void)
           char *mem = kalloc();
           if (mem == 0)
           {
-            setkilled(p);
+            setkilled(t);
           }
           else
           {
@@ -126,37 +126,37 @@ usertrap(void)
       }
       else
       {
-        if (vmfault(p->family->pagetable, va, 0) == 0)
-          setkilled(p);
+        if (vmfault(t->family->pagetable, va, 0) == 0)
+          setkilled(t);
       }
     }
   }
   else if ((r_scause() == 13 || r_scause() == 12) &&
-           vmfault(p->family->pagetable, r_stval(), (r_scause() == 13) ? 1 : 0) != 0)
+           vmfault(t->family->pagetable, r_stval(), (r_scause() == 13) ? 1 : 0) != 0)
   {
     // page fault on lazily-allocated page
   }
   else
   {
-    printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->tid);
+    printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), t->tid);
     printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
-    setkilled(p);
+    setkilled(t);
   }
 
-  if (killed(p))
-    kexit(-1);
+  if (killed(t))
+    kexit_thread(-1);
 
   // give up the CPU if this is a timer interrupt.
   if (which_dev == 2)
   {
-    p->cpu_time += 10;
+    t->cpu_time += 10;
     yield();
   }
 
   prepare_return();
 
   // the user page table to switch to, for trampoline.S
-  uint64 satp = MAKE_SATP(p->family->pagetable);
+  uint64 satp = MAKE_SATP(t->family->pagetable);
 
   // return to trampoline.S; satp value in a0.
   return satp;

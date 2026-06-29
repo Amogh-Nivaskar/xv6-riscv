@@ -48,4 +48,6 @@ entry("getprocinfo");
 entry("settracer");
 entry("sleep");
 entry("setscheduler");
-entry("clone")
+entry("clone");
+entry("exit_thread");
+entry("join")

@@ -27,3 +27,5 @@
 #define SYS_sleep 26
 #define SYS_setscheduler 27
 #define SYS_clone 28
+#define SYS_exit_thread 29
+#define SYS_join 30

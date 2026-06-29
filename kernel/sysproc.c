@@ -236,3 +236,18 @@ uint64 sys_clone(void)
 
   return kclone(f, a);
 }
+
+uint64 sys_exit_thread(void)
+{
+  int status;
+  argint(0, &status);
+  kexit_thread(status);
+  return 0; // not reached
+}
+
+uint64 sys_join(void)
+{
+  uint64 addr;
+  argaddr(0, &addr);
+  return kjoin(addr);
+}

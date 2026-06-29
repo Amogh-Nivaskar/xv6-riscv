@@ -102,6 +102,8 @@ extern uint64 sys_settracer(void);
 extern uint64 sys_sleep(void);
 extern uint64 sys_setscheduler(void);
 extern uint64 sys_clone(void);
+extern uint64 sys_exit_thread(void);
+extern uint64 sys_join(void);
 
 // An array mapping syscall numbers from syscall.h
 // to the function that handles the system call.
@@ -134,6 +136,8 @@ static uint64 (*syscalls[])(void) = {
     [SYS_sleep] sys_sleep,
     [SYS_setscheduler] sys_setscheduler,
     [SYS_clone] sys_clone,
+    [SYS_exit_thread] sys_exit_thread,
+    [SYS_join] sys_join,
 };
 
 static char *syscall_name_map[] = {

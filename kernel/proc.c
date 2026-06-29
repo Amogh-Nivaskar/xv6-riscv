@@ -744,43 +744,107 @@ void reparent(struct thread_family_shared *f)
 void kexit(int status)
 {
   struct thread *t = mythread();
+  struct thread_family_shared *f = t->family;
+
+  acquire(&f->spinlk);
+  f->no_clone = 1;
+  int siblings = f->tcount - 1;
+  release(&f->spinlk);
+
+  acquire(&thread_list_lock);
+  for (struct thread *tt = init_thread; tt != NULL; tt = tt->next)
+  {
+    if (tt->family == f && tt->tid != t->tid)
+    {
+      kkill_thread(tt->tid, 0);
+    }
+  }
+  release(&thread_list_lock);
+
+  for (int i = 0; i < siblings; i++)
+  {
+    kjoin(0);
+  }
+
+  kexit_thread(status);
+}
+
+void kexit_thread(int status)
+{
+  struct thread *t = mythread();
+  struct thread_family_shared *f = t->family;
 
   if (t == init_thread)
     panic("init exiting");
 
-  // Close all open files.
-  for (int fd = 0; fd < NOFILE; fd++)
+  acquire(&f->spinlk);
+  f->tcount--;
+  int thread_count = f->tcount;
+  release(&f->spinlk);
+
+  if (thread_count == 0)
   {
-    if (t->family->ofile[fd])
+    acquiresleep(&f->sleeplk);
+    for (int fd = 0; fd < NOFILE; fd++)
     {
-      struct file *f = t->family->ofile[fd];
-      fileclose(f);
-      t->family->ofile[fd] = 0;
+      if (t->family->ofile[fd])
+      {
+        struct file *f = t->family->ofile[fd];
+        fileclose(f);
+        t->family->ofile[fd] = 0;
+      }
     }
+
+    for (int i = 0; i < NVMA; i++)
+    {
+      struct vma v = f->vmas[i];
+      if (v.inode != 0)
+      {
+        iput(v.inode);
+      }
+    }
+    memset(f->vmas, 0, sizeof(f->vmas));
+
+    begin_op();
+    iput(f->cwd);
+    end_op();
+    f->cwd = 0;
+
+    releasesleep(&f->sleeplk);
+
+    acquire(&wait_lock);
+
+    // Give any children to init.
+    reparent(f);
+
+    // Parent might be sleeping in wait().
+    wakeup(f->parent_family);
+
+    acquire(&t->lock);
+
+    f->xstate = status;
+    t->state = ZOMBIE;
+    if (t->exit_tick == -1)
+      t->exit_tick = ticks;
+
+    release(&wait_lock);
+  }
+  else
+  {
+    acquire(&wait_lock);
+
+    wakeup(f);
+
+    acquire(&t->lock);
+
+    t->xstate = status;
+    t->state = ZOMBIE;
+    if (t->exit_tick == -1)
+      t->exit_tick = ticks;
+
+    release(&wait_lock);
   }
 
-  begin_op();
-  iput(t->family->cwd);
-  end_op();
-  t->family->cwd = 0;
-
-  acquire(&wait_lock);
-
-  // Give any children to init.
-  reparent(t->family);
-
-  // Parent might be sleeping in wait().
-  wakeup(t->family->parent_family);
-
-  acquire(&t->lock);
-
-  t->xstate = status;
-  t->state = ZOMBIE;
-  if (t->exit_tick == -1)
-    t->exit_tick = ticks;
-
-  release(&wait_lock);
-  // Jump into the scheduler, never to return.
   sched();
   panic("zombie exit");
 }
@@ -789,9 +853,9 @@ void kexit(int status)
 // Return -1 if this process has no children.
 int kwait(uint64 addr)
 {
-  struct thread *tt;
+  struct thread_family_shared *ff;
   int havekids, fid;
-  struct thread *t = mythread();
+  struct thread_family_shared *f = myfamily();
 
   acquire(&wait_lock);
 
@@ -799,20 +863,129 @@ int kwait(uint64 addr)
   {
     // Scan through table looking for exited children.
     havekids = 0;
+    int needs_retry = 0;
+    acquire(&family_list_lock);
+    for (ff = init_family; ff != NULL; ff = ff->next)
+    {
+      acquire(&ff->spinlk);
+      if (ff->parent_family == f)
+      {
+        // make sure the child isn't still in exit() or swtch().
+
+        havekids = 1;
+
+        if (ff->tcount == 0)
+        {
+          fid = ff->fid;
+          int xstate = ff->xstate;
+          release(&ff->spinlk);
+
+          // Verify all threads are ZOMBIE before freeing. A thread may have
+          // decremented tcount to 0 but not yet acquired wait_lock to set ZOMBIE.
+          // Since we hold wait_lock, it's blocked — sleep to let it proceed.
+          int ready = 1;
+          acquire(&thread_list_lock);
+          for (struct thread *tt = init_thread; tt != NULL; tt = tt->next)
+          {
+            if (tt->family == ff)
+            {
+              acquire(&tt->lock);
+              if (tt->state != ZOMBIE)
+                ready = 0;
+              release(&tt->lock);
+            }
+          }
+          release(&thread_list_lock);
+
+          if (!ready)
+          {
+            release(&family_list_lock);
+            sleep(f, &wait_lock); // releases wait_lock; dying thread proceeds → sets ZOMBIE → wakeup(f)
+            needs_retry = 1;
+            break;
+          }
+
+          acquire(&thread_list_lock);
+          struct thread *tt = init_thread;
+          while (tt != NULL)
+          {
+            struct thread *tnext = tt->next;
+            if (tt->family == ff)
+            {
+              release(&thread_list_lock);
+              free_thread(tt);
+              acquire(&thread_list_lock);
+              tt = init_thread;
+            }
+            else
+            {
+              tt = tnext;
+            }
+          }
+          release(&thread_list_lock);
+
+          if (addr != 0 && copyout(f->pagetable, addr, (char *)&xstate,
+                                   sizeof(xstate)) < 0)
+          {
+            release(&family_list_lock);
+            release(&wait_lock);
+            return -1;
+          }
+          // Release both locks before free calls: free_family -> wakeup and
+          // free_thread both try to acquire thread_list_lock.
+          // wait_lock is still held so no concurrent kwait can race on this zombie.
+
+          release(&family_list_lock);
+          free_family(ff);
+          release(&wait_lock);
+          return fid;
+        }
+      }
+      release(&ff->spinlk);
+    }
+    if (!needs_retry)
+      release(&family_list_lock); // only release if inner loop ran to completion
+
+    if (needs_retry)
+      continue; // ← this continue is on the outer for(;;), restarts whole scan
+
+    // No point waiting if we don't have any children.
+    if (!havekids)
+    {
+      release(&wait_lock);
+      return -1;
+    }
+
+    // Wait for a child to exit.
+    sleep(f, &wait_lock); // DOC: wait-sleep
+  }
+}
+
+int kjoin(uint64 addr)
+{
+  struct thread *tt;
+  int havesiblings, tid;
+  struct thread *t = mythread();
+
+  acquire(&wait_lock);
+
+  for (;;)
+  {
+    // Scan through table looking for exited children.
+    havesiblings = 0;
     acquire(&thread_list_lock);
     for (tt = init_thread; tt != NULL; tt = tt->next)
     {
-      if (tt->state != UNUSED && tt->family != NULL && tt->family->parent_family == t->family)
+      if (tt->state != UNUSED && tt->family != NULL && tt->family == t->family && tt->tid != t->tid)
       {
         // make sure the child isn't still in exit() or swtch().
         acquire(&tt->lock);
 
-        havekids = 1;
+        havesiblings = 1;
         if (tt->state == ZOMBIE)
         {
           // Found one.
-          fid = tt->family->fid;
-          struct thread_family_shared *zombie_family = tt->family;
+          tid = tt->tid;
           if (addr != 0 && copyout(t->family->pagetable, addr, (char *)&tt->xstate,
                                    sizeof(tt->xstate)) < 0)
           {
@@ -827,9 +1000,8 @@ int kwait(uint64 addr)
           release(&tt->lock);
           release(&thread_list_lock);
           free_thread(tt);
-          free_family(zombie_family);
           release(&wait_lock);
-          return fid;
+          return tid;
         }
         release(&tt->lock);
       }
@@ -837,7 +1009,7 @@ int kwait(uint64 addr)
     release(&thread_list_lock);
 
     // No point waiting if we don't have any children.
-    if (!havekids || killed(t))
+    if (!havesiblings || killed(t))
     {
       release(&wait_lock);
       return -1;
@@ -1130,13 +1302,14 @@ void wakeup(void *chan)
 // Kill the process with the given pid.
 // The victim won't exit until it tries to return
 // to user space (see usertrap() in trap.c).
-int kkill(int tid)
+int kkill_thread(int tid, int holdlock)
 {
-  acquire(&thread_list_lock);
+  if (holdlock)
+    acquire(&thread_list_lock);
   for (struct thread *t = init_thread; t != NULL; t = t->next)
   {
     acquire(&t->lock);
-    if (t->family != NULL && t->family->fid == tid)
+    if (t->tid == tid)
     {
       t->killed = 1;
       if (t->state == SLEEPING)
@@ -1146,13 +1319,40 @@ int kkill(int tid)
         t->last_runnable_tick = ticks;
       }
       release(&t->lock);
-      release(&thread_list_lock);
+      if (holdlock)
+        release(&thread_list_lock);
       return 0;
     }
     release(&t->lock);
   }
-  release(&thread_list_lock);
+  if (holdlock)
+    release(&thread_list_lock);
   return -1;
+}
+
+int kkill(int fid)
+{
+  int found = 0;
+
+  acquire(&thread_list_lock);
+  for (struct thread *t = init_thread; t != NULL; t = t->next)
+  {
+    if (t->family != NULL && t->family->fid == fid)
+    {
+      found = 1;
+      kkill_thread(t->tid, 0);
+    }
+  }
+  release(&thread_list_lock);
+
+  if (found == 0)
+  {
+    return -1;
+  }
+  else
+  {
+    return 0;
+  }
 }
 
 void setkilled(struct thread *t)

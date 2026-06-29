@@ -34,9 +34,11 @@ int kexec(char *path, char **argv)
   pagetable_t pagetable = 0, oldpagetable;
   struct vma vmas[NVMA] = {0};
   struct thread *t = mythread();
+  struct thread_family_shared *f = t->family;
   int nvma = 0;
   int old_slotIdx = t->slot_index;
   struct trapframe *old_trapframe = t->trapframe;
+  int siblings = 0;
 
   begin_op();
 
@@ -150,6 +152,26 @@ int kexec(char *path, char **argv)
     }
   }
 
+  // All failure-prone operations are done. Now it's safe to kill siblings:
+  // if exec had failed above, they would still be alive and the process
+  // would continue normally. From here there are no more failure modes.
+  acquire(&f->spinlk);
+  f->no_clone = 1;
+  siblings = f->tcount - 1;
+  release(&f->spinlk);
+
+  if (siblings > 0)
+  {
+    acquire(&thread_list_lock);
+    for (struct thread *tt = init_thread; tt != 0; tt = tt->next)
+      if (tt->family == f && tt->tid != t->tid)
+        kkill_thread(tt->tid, 0);
+    release(&thread_list_lock);
+
+    for (int i = 0; i < siblings; i++)
+      kjoin(0);
+  }
+
   // Commit to the user image.
   oldpagetable = t->family->pagetable;
   t->family->pagetable = pagetable;
@@ -160,6 +182,11 @@ int kexec(char *path, char **argv)
   t->trapframe->sp = sp;         // initial stack pointer
   unmap_slot(old_slotIdx, oldpagetable, 1);
   family_freepagetable(oldpagetable, oldsz);
+
+  // New program starts single-threaded; allow cloning again.
+  acquire(&f->spinlk);
+  f->no_clone = 0;
+  release(&f->spinlk);
 
   return argc; // this ends up in a0, the first argument to main(argc, argv)
 

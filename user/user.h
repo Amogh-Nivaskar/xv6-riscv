@@ -33,6 +33,8 @@ int settracer(int value);
 int sleep(int duration);
 int setscheduler(int mode);
 int clone(void (*fn)(void *), void *arg);
+void exit_thread(int status);
+int join(uint64 *status);
 
 // ulib.c
 int stat(const char *, struct stat *);

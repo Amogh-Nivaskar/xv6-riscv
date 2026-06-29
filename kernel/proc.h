@@ -159,6 +159,8 @@ struct thread_family_shared
   struct thread_family_shared *next;
   int fid;
 
+  int xstate;
+
   int tcount;
   int no_clone;
   int slot_tracking[NFAMILY_THREADS];
