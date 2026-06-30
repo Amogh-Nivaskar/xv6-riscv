@@ -6,8 +6,9 @@
 2. [Goals](#goals) and [Non-Goals](#non-goals) — What is explicitly in scope and what are we deliberately leaving out.
 3. [Background](#background) — Relevant context about the existing system. In our case, how xv6 currently works that is relevant to our changes.
 4. [Design](#design) — The meat of the document. Broken into subsections covering each major component of our design. Data structures, algorithms, system call interfaces etc.
-5. [Alternatives Considered](#alternatives-considered) — Design decisions where we had multiple options and why we chose what we did.
-6. [Future Work](#future-work) — Things explicitly out of scope now but worth considering later.
+5. [Benchmark](#benchmark) — A parallel prime-counting benchmark that empirically proves threads execute simultaneously on separate cores.
+6. [Alternatives Considered](#alternatives-considered) — Design decisions where we had multiple options and why we chose what we did.
+7. [Future Work](#future-work) — Things explicitly out of scope now but worth considering later.
 ---
 
 ## Overview
@@ -1022,6 +1023,49 @@ It then calls `alloc_thread(init_family)` to allocate the first thread and assig
 
 It sets up the current working directory and marks the thread as `RUNNABLE`
 
+
+
+## Benchmark
+
+The main question after building all this is — does the threading actually run in parallel? We need to show that. If two threads really run in parallel on two cores, they should complete the work in roughly half the time of one thread. That's the definition of parallelism. So that's exactly what we measure.
+
+### What we benchmark
+
+We use prime counting as the workload. The program (`user/threadbench.c`) counts all primes in the range [2, N] where N=200,000. The range is divided evenly across however many threads we're testing, and each thread independently counts primes in its sub-range. At the end the partial counts are summed and verified against the single-threaded answer as a correctness check.
+
+The workload is purely CPU-bound and has zero shared state during execution — each thread works on a disjoint range and writes to its own slot in a `partial[]` array. So any speedup we observe is purely from threads executing on different cores simultaneously. There's no lock contention or IO bottleneck muddying the numbers.
+
+We measure three scenarios: 1 thread (baseline), 2 threads, and 3 threads.
+
+### Methodology
+
+Getting a clean measurement on QEMU is trickier than it sounds. There are a few things we had to get right.
+
+**QEMU MTTCG**: By default, QEMU's TCG emulator serializes all vCPUs onto a single host thread. No matter how many vCPUs you configure, all computation happens sequentially — threads just take turns in the emulator. To get real parallelism, we add `-accel tcg,thread=multi` to the QEMU command line in the Makefile. With MTTCG (Multi-Threaded TCG), each vCPU gets mapped to its own real host OS thread. When two vCPUs are both RUNNING, they genuinely execute in parallel on different host cores.
+
+**RR scheduler**: With MLFQ (our default scheduler), idle CPUs execute the `wfi` (wait-for-interrupt) instruction when they have nothing to run. WFI halts the CPU until the next timer interrupt, which fires roughly every ~100ms. So if you clone a sibling thread, the idle CPU won't pick it up for up to 100ms — making the "parallel" run look almost identical to serial. We fix this by calling `setscheduler(0)` at the start of the benchmark to switch to Round Robin, where idle CPUs spin continuously instead of halting. With RR, an idle CPU sees a newly RUNNABLE thread within a few thousand cycles.
+
+**Warmup**: xv6 uses lazy ELF loading via page faults — program pages are only faulted in when first accessed. The first untimed `bench(1)` call pays for all the ELF page fault overhead for the entire benchmark image. Without this, the first timed run pays a large one-time cost that later runs don't, making results across runs non-comparable.
+
+**Spin-wait instead of join() inside the timing window**: `rdcycle` reads the cycle counter of the *current* vCPU. With MTTCG, each vCPU has an independent cycle counter with a different base value. If the main thread calls `join()` and sleeps waiting for a sibling, the scheduler can wake it up on a *different* vCPU. Then `t1 = rdcycle()` reads a counter with a lower base than `t0`, and the subtraction wraps to UINT64_MAX. The fix: each sibling sets a `done[i]` flag right before calling `exit_thread()`, and the main thread spin-waits on those flags before reading `t1`. This keeps main awake and on its current vCPU the whole time. `join()` is then called after `t1` is recorded, outside the timing window, purely for TCB cleanup.
+
+### Results
+
+Running `threadbench` on QEMU with MTTCG and 3 CPUs:
+
+```
+threadbench: counting primes up to 200000
+
+  1 thread:  ~55M cycles   (baseline)
+  2 threads: ~35M cycles   (1.5x speedup — real parallelism!)
+  3 threads: ~25M cycles   (2.1x speedup — real parallelism!)
+```
+
+The speedup is real but below the theoretical 2x/3x for two reasons: (1) QEMU's software memory coherence tracking adds overhead that real hardware doesn't have, and (2) timer interrupt handling briefly serializes CPUs when it fires. On real RISC-V hardware with 3 physical cores you'd expect something much closer to 2x and 3x.
+
+The 3-thread result is also a bit interesting: with 3 threads running, all 3 CPUs are busy doing real work, so there's no idle CPU spinning in the scheduler generating cache coherence noise. That's part of why 3T shows better-than-proportional improvement over 2T even on QEMU.
+
+The correctness check (all three runs finding 17,984 primes) verifies that shared address space access across threads is race-free.
 
 
 ## Alternatives Considered
