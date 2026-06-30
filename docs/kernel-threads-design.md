@@ -25,10 +25,10 @@ We need to redefine the `struct proc` into a `struct thread` which will have the
 
 We also need to add three new userspace APIs:
 - `int clone(void (*fn)(void *), void *arg);`
-- `void exit_thread(void);`
+- `void exit_thread(int status);`
 - `int join(uint64 addr);`
 
-`clone()` creates a new child thread from the currently running thread. The caller provides a function pointer indicating where the new thread should begin execution, along with the argument to pass to that function. `exit_thread()` terminates the calling thread. `join()` makes the calling thread wait for a sibling thread to exit.
+`clone()` creates a new child thread from the currently running thread. The caller provides a function pointer indicating where the new thread should begin execution, along with the argument to pass to that function. `exit_thread(status)` terminates the calling thread and passes a status code to whoever calls `join()`. `join()` makes the calling thread wait for a sibling thread to exit.
 
 We also need to modify the behavior of some existing system calls:
 
@@ -264,6 +264,8 @@ struct thread_family_shared {
   struct thread_family_shared *next;
   int fid;
 
+  int xstate;
+
   int tcount;
   int no_clone;
   int slot_tracking[NFAMILY_THREADS];
@@ -292,6 +294,8 @@ The `slot_tracking` array is a boolean array. If `slot_tracking[slot_index] == 1
 `heap_reserve` is the boundary beyond which thread slots can't be allocated. This will be explained in more detail in the [New Virtual Memory Layout](#user-mode-virtual-address-space-memory-layout) subsection.
 
 The `no_clone` boolean flag, basically doesn't allow for a thread to be cloned (i.e. another thread to be created) if it is True. We need to turn off cloning especially when we call `exec()` and kill off all the other family threads, and don't want any new threads created and also in `exit()` when we want to kill all the threads in the family and hence don't want any new threads to be created.
+
+`xstate` is the exit status of the family. When the last thread in the family calls `exit_thread(status)`, it stores `status` here. This is what `kwait()` reads and copies back to the parent after all the threads have been freed and the family is reaped. Note that `xstate` lives on both the thread struct and the family struct — the thread-level one is used by `join()` to retrieve the exit status of a specific sibling thread, while the family-level one is used by `wait()` to retrieve the exit status of the whole child family.
 
 The `tcount` field keeps count of the number of threads alive in this family.
 
@@ -783,28 +787,37 @@ It is called by a thread when it wants to delete itself and is passed in a statu
 To achieve this, it does the following:
 1. Access calling thread - `struct thread *td = mythread()`
 2. Access calling thread's family - `struct thread_family_shared *family = td->family;`
-3. Acquire global spin lock `wait_lock`.
-4. Decrement threads count:
+3. Decrement threads count:
    1. Acquire spin lock `spinlk` on family.
    2. Decrement threads counter - `family->tcount -= 1`
    3. Save current thread count - `int thread_count = family->tcount`
    4. Release lock
-5. If `thread_count == 0`, then do the following or else go to *step 6*:
+4. If `thread_count == 0`, this is the last thread in the family, so do the following or else go to *step 5*:
    1. Acquire sleep lock `sleeplk` on the family
-   2. Clean up all externel resources of the family i.e. the open files, the current working directory inode, the VMAs.
+   2. Clean up all external resources of the family i.e. the open files, the current working directory inode, the VMAs.
    3. Release the `sleeplk` lock.
-   4. Acquire global spin lock `family_list_lock`.
+   4. Acquire global spin lock `wait_lock`.
    5. Call `reparent()` to change the parent family of all of its children families to `init_thread->family`.
-   6. Release the `family_list_lock` lock.
-   7. Wake up a thread in the parent family, sleeping on the parent family's channel - `wakeup(family->parent_family)`.
-6. Else, then we wake up a sibling thread sleeping on the family's channel - `wakeup(family)`.
-7. Updating the dying state of the thread:
-   1. Acquire spin lock `lock` on the thread
-   2. Save the exit status - `td->xstate = status;`
-   3. Change the state - `td->state = ZOMBIE;`
-   [**NOTE :** The thread's spin lock is acquired, but not explicitly released here, as it should be held when calling `sched()` and released by the scheduler after context switch. ]
-8. Release `wait_lock`.
-9.  Jump into the scheduler, never to return to this thread - `sched()`.
+   6. Wake up a thread in the parent family, sleeping on the parent family's channel - `wakeup(family->parent_family)`.
+   7. Acquire spin lock `lock` on the thread.
+   8. Save the exit status on the **family** - `family->xstate = status;` — this is what `kwait()` will read later.
+   9. Change the state - `td->state = ZOMBIE;`
+   10. Release `wait_lock`.
+5. Else (not the last thread), do the following:
+   1. Acquire global spin lock `wait_lock`.
+   2. Wake up a sibling thread sleeping on the family's channel - `wakeup(family)`.
+   3. Acquire spin lock `lock` on the thread.
+   4. Save the exit status on the **thread** - `td->xstate = status;` — this is what `kjoin()` will read directly from the ZOMBIE thread struct.
+   5. Change the state - `td->state = ZOMBIE;`
+   6. Release `wait_lock`.    
+
+   [**NOTE :** The thread's spin lock is acquired before calling `sched()` and released by the scheduler after context switch. ]  
+
+6. Jump into the scheduler, never to return to this thread - `sched()`.
+
+So to summarize — `xstate` is stored in two different places depending on who's exiting:
+- **Last thread** → `family->xstate`, because by the time `kwait()` gets to read it, the thread struct may already be freed.
+- **Non-last thread** → `td->xstate`, because the thread struct is still alive and `kjoin()` reads directly from it before calling `free_thread()`.
 
 
 
@@ -910,8 +923,9 @@ This subsection is dedicated to mechanisms which are derived from existing desig
 This allows a thread to wait for all the threads of a child family to exit.
 
 Here, instead of looping over the processes to find a child zombie process, it will loop over families to find a dead child family i.e. `tcount == 0`.
-If it is found, it then loops over the TCB to find all the zombie threads and for each such thread `zb_td`, it calls `free_thread(zb_td)`.
-At last it then calls `free_family(dead_family)` to free the dead family, stores exit status in passed address and then return its FID.
+If it finds one, there's a subtle race to be careful about: a thread may have decremented `tcount` to 0 but not yet reached the point where it sets its state to `ZOMBIE` (it still needs to acquire `wait_lock` to do that). So before we start freeing anything, we scan the TCB and verify that every thread in that family is actually in `ZOMBIE` state. If any of them isn't ready yet, we release the FCB lock, sleep to let the dying thread finish, and then restart the whole scan from the beginning (using a `needs_retry` flag + `break` to exit the inner loop, then `continue` on the outer `for(;;)` — can't use `continue` directly because that would restart the inner loop, not the outer one).
+
+Once all threads are confirmed ZOMBIE, we loop over the TCB and call `free_thread(zb_td)` on each one. Then we call `free_family(dead_family)` to free the dead family, copy the exit status (stored in `family->xstate`) to the passed address, and return the FID.
 
 If it doesn't find such a family, it sleeps on its own family as the channel, so that it is awoken when a child exits and it is the last child in its family. After it is awoken, it repeats the same process again.
 
@@ -919,8 +933,9 @@ If it doesn't find such a family, it sleeps on its own family as the channel, so
 It allows a thread to wait for a sibling thread i.e. a thread belonging to the same family, to exit.
 
 Its structure is very similar to the new `wait()`.
-It loops over the TCB, to find a zombie sibling thread (`zb_td`).  
-If it is found, it frees this thread by calling `free_thread(zb_td)`, stores exit status in passed address and then returns its TID 
+It loops over the TCB, to find a zombie sibling thread (`zb_td`). One important thing to note here: the loop condition must explicitly exclude the calling thread itself (`tt->tid != t->tid`). Without this, the thread would count itself as a sibling, which would cause it to either hang waiting for itself or try to free itself — neither of which ends well.
+
+If a zombie sibling is found, it reads the exit status directly from `tt->xstate` on the thread struct (unlike `kwait()` which reads from `family->xstate`, `join()` can read directly from the thread since it's still alive as a ZOMBIE). It then frees the thread by calling `free_thread(zb_td)`, copies the status to the passed address and returns its TID.
 
 If it doesn't find such a thread, it sleeps on its own family as the channel, so that it is awoken when a sibling thread exits. After it is awoken, it repeats the same process again.
 
@@ -941,9 +956,17 @@ If it doesn't such a family, it returns -1.
 #### 5. Modified `exec()`
 It overrides the calling thread's current running program with a new one.
 
-To achieve this, it first turns off cloning and then kills all of its sibling threads and waits for them to exit using `join()`.
+The key design decision here is **when** to kill the sibling threads. The tempting approach is to kill them first thing, but that's actually wrong — if `exec()` fails partway through (bad ELF, OOM, etc.), you've already killed all your siblings for nothing and you can't get them back. So instead, we do all the failure-prone work first — ELF parsing, setting up the new page table, allocating stack, copying arguments — and only after all of that succeeds and we're past any possible failure, do we kill the siblings:
 
-The rest of the execution is similar to the original, except that rather than setting up the fields on a process, we are doing it on the thread and its family. 
+1. Set `f->no_clone = 1` so no new threads sneak in during the transition.
+2. Kill all sibling threads with `kill_thread()`.
+3. `join()` each one to wait for them to fully exit.
+4. Commit the new address space.
+5. Reset `f->no_clone = 0`.
+
+This way, if exec fails and takes the `bad:` path, the siblings are still alive and the process is in exactly the state it was before exec was called. The `no_clone` flag is also never set in the `bad:` path, since we haven't reached that point yet.
+
+The rest of the execution is similar to the original, except that rather than setting up the fields on a process, we are doing it on the thread and its family.
 
 To be more precise, we override the family's page table (`pagetable`), heap size (`sz`), VMAs list (`vmas[]`). In case of the thread itself, we override the program counter (`trapframe->epc`) and user stack pointer (`trapframe->sp`) in trapframe and the kernel stack pointer in the context (`context->sp`)
 
