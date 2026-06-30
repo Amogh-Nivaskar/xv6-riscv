@@ -1,5 +1,7 @@
 # Building a Multi-Level Feedback Queue Scheduler in xv6
 
+*The full xv6 implementation, benchmarks, and test programs are available on* [*GitHub*](https://github.com/Amogh-Nivaskar/xv6-riscv/tree/mlfq-scheduler)
+
 ## The Problem
 
 xv6's default round-robin scheduler has no concept of what a process is doing with its
@@ -30,29 +32,33 @@ MLFQ maintains multiple queues, each representing a priority level. Processes st
 the top (highest priority) and migrate downward as they consume CPU time.
 
 ```
-  Priority 0 (highest)  ┌───────────────────────────────┐
-  Allotment: 100 units   │  [shell]  [editor]            │  ← Interactive processes
-                         └───────────────────────────────┘
-                                        │ exhaust allotment
-                                        ▼
-  Priority 1             ┌───────────────────────────────┐
-  Allotment: 200 units   │  [medium CPU job]             │
-                         └───────────────────────────────┘
-                                        │ exhaust allotment
-                                        ▼
-  Priority 2             ┌───────────────────────────────┐
-  Allotment: 400 units   │  [compiler]                   │
-                         └───────────────────────────────┘
-                                        │ exhaust allotment
-                                        ▼
-  Priority 3 (lowest)   ┌───────────────────────────────┐
-  Allotment: 800 units   │  [heavy batch jobs]           │  ← CPU-bound processes
-                         └───────────────────────────────┘
+  Priority 0 (highest) — Allotment: 100 units
+  ┌──────────────────────────────────────┐
+  │  [shell]  [editor]   ← interactive  │
+  └──────────────────────────────────────┘
+                  │ exhaust allotment
+                  ▼
+  Priority 1 — Allotment: 200 units
+  ┌──────────────────────────────────────┐
+  │  [medium CPU job]                    │
+  └──────────────────────────────────────┘
+                  │ exhaust allotment
+                  ▼
+  Priority 2 — Allotment: 400 units
+  ┌──────────────────────────────────────┐
+  │  [compiler]                          │
+  └──────────────────────────────────────┘
+                  │ exhaust allotment
+                  ▼
+  Priority 3 (lowest) — Allotment: 800 units
+  ┌──────────────────────────────────────┐
+  │  [heavy batch jobs]   ← CPU-bound   │
+  └──────────────────────────────────────┘
 ```
 
 ### Rules
 
-1. **Priority order**: Always run the RUNNABLE process at the highest priority queue.
+1. **Priority order**: Always run the `RUNNABLE` process at the highest priority queue.
 2. **Demotion**: When a process exhausts its allotment at level *N*, move it to level *N+1* and reset its accumulated time.
 3. **I/O shortcut**: A process that blocks on I/O before exhausting its allotment keeps its current priority — it didn't consume what it was given.
 4. **Priority boost**: Periodically, reset all processes to priority 0. This prevents starvation of processes that have drifted to the bottom.
@@ -61,17 +67,18 @@ the top (highest priority) and migrate downward as they consume CPU time.
 
 ```
   New process arrives
-        │
-        ▼
-  ┌──────────────┐    Uses full allotment?    ┌──────────────┐
-  │  Priority 0  │ ─── YES ─────────────────► │  Priority 1  │ ──► ... ──► Priority 3
-  │  (top queue) │                            └──────────────┘
+         │
+         ▼
+  ┌──────────────┐
+  │  Priority 0  │── uses full allotment
+  │  (top queue) │        ──► P1 ──► ... ──► P3
   └──────────────┘
-        │
-        │  Blocks on I/O before allotment?
-        ▼
-  Stays at Priority 0  ◄──────── wakeup() ──────── SLEEPING
-  (interactive reward)
+         │
+         │ blocks on I/O before allotment
+         ▼
+  ┌──────────────┐
+  │   SLEEPING   │── wakeup() ──► stays at Priority 0
+  └──────────────┘               (interactive reward)
 ```
 
 The feedback loop is entirely implicit — no system calls, no hints from the programmer.
@@ -83,7 +90,7 @@ an interactive task gets low latency, automatically.
 ## The Naive Solution and Why It Fails
 
 The original xv6 scheduler is a textbook round-robin: scan the process table, pick the
-first RUNNABLE entry, run it, repeat.
+first `RUNNABLE` entry, run it, repeat.
 
 ```c
 void sched_rr(struct cpu *c) {
@@ -113,13 +120,14 @@ a matrix multiply that holds the CPU for its full tick.
 ```
   Round-Robin queue (all processes treated equally):
 
-  ┌──────────┬──────────┬──────────┬──────────┬──────────┐
-  │  shell   │ compiler │  shell   │ compiler │  shell   │  ...
-  │ (1 tick) │(10 ticks)│ (1 tick) │(10 ticks)│ (1 tick) │
-  └──────────┴──────────┴──────────┴──────────┴──────────┘
-       ▲                                            │
-       └────────────────────────────────────────────┘
-       Shell waits through every compiler turn before responding
+  ┌─────────┬───────────┬─────────┬───────────┐
+  │  shell  │ compiler  │  shell  │ compiler  │ ...
+  │ (1 tick)│ (10 ticks)│ (1 tick)│ (10 ticks)│
+  └─────────┴───────────┴─────────┴───────────┘
+       ▲                                  │
+       └──────────────────────────────────┘
+  Shell waits through every compiler turn
+  before getting scheduled again.
 ```
 
 The cost is entirely in first-response latency. For a CPU-bound batch job, waiting one
@@ -150,7 +158,7 @@ belong.
 I needed a unit of measurement that captures actual CPU consumption. The obvious approach
 is to increment `cpu_time` only on timer interrupts — each tick is 10 units, demotion
 happens after allotment/10 ticks. This is where a subtle vulnerability appears, which
-I'll describe in detail in the Future Work section.
+I'll describe in detail in the [future work](#what-id-do-differently--whats-next) section.
 
 The fix baked into the current implementation: syscalls are also charged. Every trap into
 the kernel that represents a syscall increments `cpu_time` by 1. Timer interrupts
@@ -171,14 +179,16 @@ loops between timer interrupts accumulates it in large jumps of 10.
   CPU-bound process:
   ┌─────────────────────────────────────────┐
   │  timer  timer  timer  timer  timer  ... │
-  │  +10    +10    +10    +10    +10        │  → demoted quickly
+  │  +10    +10    +10    +10    +10        │
   └─────────────────────────────────────────┘
+  → demoted quickly
 
   I/O-bound process:
   ┌─────────────────────────────────────────┐
   │ syscall sleep  syscall sleep  syscall   │
-  │  +1    (0)     +1    (0)     +1         │  → stays at high priority
+  │  +1    (0)     +1    (0)     +1         │
   └─────────────────────────────────────────┘
+  → stays at high priority
 ```
 
 ### The priority boost — preventing starvation
@@ -194,13 +204,21 @@ The fix is periodic: every `MLFQ_BOOST` ticks (500 — about 5 seconds), every p
 gets reset to priority 0 with cpu_time cleared.
 
 ```
-  Before boost:                       After boost (every 500 ticks):
-
-  Priority 0: [shell]                 Priority 0: [shell] [batch1] [batch2] [compiler]
+  Before boost:
+  Priority 0: [shell]
   Priority 1: []
-  Priority 2: [batch1]          ──►   Priority 1: []
-  Priority 3: [batch2][compiler]      Priority 2: []
-                                      Priority 3: []
+  Priority 2: [batch1]
+  Priority 3: [batch2] [compiler]
+
+        │
+        │ every 500 ticks: reset all to priority 0
+        ▼
+
+  After boost:
+  Priority 0: [shell] [batch1] [batch2] [compiler]
+  Priority 1: []
+  Priority 2: []
+  Priority 3: []
 ```
 
 The implementation does this inline in the scan loop — all processes either get boosted
@@ -307,19 +325,18 @@ The complete lifecycle of a process through the scheduler looks like this:
         │
         │  swtch() → process runs
         ▼
-  ┌──────────────┐     timer interrupt      ┌────────────────────┐
-  │   RUNNING    │ ──── cpu_time += 10 ───► │  yield() → sched() │
-  │              │     → yield()            └────────────────────┘
-  │              │
-  │              │     syscall              ┌────────────────────┐
-  │              │ ──── cpu_time += 1  ───► │  continues running │
-  │              │                          └────────────────────┘
-  │              │
-  │              │     I/O / sleep          ┌────────────────────┐
-  │              │ ────────────────────────►│  SLEEPING          │
-  └──────────────┘                          │  cpu_time frozen   │
-                                            │  priority kept     │
-                                            └────────────────────┘
+  ┌──────────────────────────────────────┐
+  │               RUNNING               │
+  └──────────────────────────────────────┘
+        │
+        ├── timer fires → cpu_time += 10
+        │   → yield() → back to scheduler
+        │
+        ├── syscall → cpu_time += 1
+        │   → continues running
+        │
+        └── I/O / sleep → SLEEPING
+            cpu_time frozen, priority kept
 ```
 
 The observability infrastructure is wired directly into the switch path, feeding the
@@ -331,20 +348,141 @@ without this visibility would be guesswork.
 
 ## Benchmarks
 
-*Results comparing MLFQ against Round-Robin across mixed CPU/IO workloads will be filled
-in after running `schedbench rr` and `schedbench mlfq` on a live xv6 instance. The
-`schedbench` program spawns 4 CPU-bound processes (busy-loop for 100 ticks) and 4
-I/O-bound processes (sleep 200 times), collects their PIDs via pipes, then reports
-turnaround time, response time, and total wait time per process class.*
+### Test Design
+
+The benchmark (`user/schedbench.c`) runs both schedulers back-to-back in a single
+invocation, switching via `setscheduler()` between rounds. Round-Robin runs first,
+MLFQ second; the same binary drives both with identical child counts and workloads.
+
+Each round spawns 12 children: 8 CPU-bound and 4 I/O-bound, against 3 CPUs — a
+4× oversubscription ratio that creates meaningful scheduling pressure.
+
+**CPU-bound workload:** Each process runs a tight arithmetic loop for 3 billion
+iterations with no syscalls in the hot path. Without syscalls in the loop, `cpu_time`
+only increments by 10 per timer interrupt, so demotion happens gradually as the process
+burns through its CPU allotment at each priority level. The 3 billion iteration count
+is sized so each process accumulates roughly 98 CPU-ticks of work — enough to be
+demoted through all three thresholds (10 ticks at priority 0, 20 more at priority 1,
+40 more at priority 2) and settle at priority 3 before exiting.
+
+**I/O-bound workload:** Each process loops 250 times: a 10,000-iteration CPU burst
+followed by `sleep(1)`. The burst is kept intentionally tiny (well under 1 timer tick)
+so the process accumulates almost no `cpu_time` from timer interrupts — only the
+syscall overhead (+1 per `sleep()` call) accumulates. After 250 rounds, accumulated
+`cpu_time` is ~250, enough for one demotion to priority 1 but never deep enough to
+compete with demoted CPU processes at priority 2–3.
+
+Results are collected through the `getprocinfo()` syscall after all children have exited
+and entered zombie state, capturing final `priority` and `total_wait_time` per process.
+
+Response time (`first_run_tick - first_runnable_tick`) was omitted from the table:
+because all 12 processes fork within a few ticks of each other and all start at
+priority 0 in both schedulers, initial response times are nearly identical. The
+per-cycle wait accumulated in `TotalWait` captures the more meaningful ongoing
+scheduling behavior once demotion has taken effect.
+
+### Results
 
 ```
-Test                      | Round-Robin | MLFQ  | Delta
---------------------------|-------------|-------|-------
-I/O response time (ticks) |     TBD     |  TBD  |  TBD
-CPU turnaround (ticks)    |     TBD     |  TBD  |  TBD
-I/O total wait (ticks)    |     TBD     |  TBD  |  TBD
-CPU total wait (ticks)    |     TBD     |  TBD  |  TBD
+=== Round-Robin (8 CPU + 4 I/O procs on 3 CPUs) ===
+Type    PID     Turnaround      TotalWait       Priority
+----    ---     ----------      ---------       --------
+CPU     4       189             115             0
+CPU     5       189             115             0
+CPU     6       197             122             0
+CPU     7       197             122             0
+CPU     8       193             120             0
+CPU     9       197             123             0
+CPU     10      197             124             0
+CPU     11      197             124             0
+I/O     12      361             111             0
+I/O     13      361             111             0
+I/O     14      361             111             0
+I/O     15      361             111             0
+
+=== MLFQ (8 CPU + 4 I/O procs on 3 CPUs) ===
+Type    PID     Turnaround      TotalWait       Priority
+----    ---     ----------      ---------       --------
+CPU     16      112             40              2
+CPU     17      126             51              2
+CPU     18      179             106             3
+CPU     19      182             109             3
+CPU     20      185             112             3
+CPU     21      188             118             3
+CPU     22      193             131             3
+CPU     23      206             147             3
+I/O     24      275             25              1
+I/O     25      275             25              1
+I/O     26      275             25              1
+I/O     27      275             25              1
 ```
+
+### Analysis
+
+**CPU Priority — the clearest signal**
+
+In Round-Robin, every CPU process exits at priority 0. The scheduler has no concept of
+what the process did with its time; every process looks identical to it. In MLFQ, every
+CPU process is demoted — 6 of 8 reach priority 3 (all three demotion thresholds
+crossed), and the other 2 land at priority 2. The scheduler correctly identified them
+as CPU hogs and pushed them down without any programmer annotation.
+
+**I/O total wait — 4.4× reduction**
+
+```
+I/O TotalWait (accumulated across 250 sleep cycles):
+  Round-Robin:  111 ticks
+  MLFQ:          25 ticks
+```
+
+Each I/O process wakes from `sleep()` 250 times. In Round-Robin, that process wakes
+into a queue of 8 CPU-bound competitors at equal priority and must wait its turn before
+any CPU becomes available. In MLFQ, the I/O process wakes at priority 0 or 1 — above
+all the demoted CPU hogs at priority 2–3 — and is scheduled on the next available CPU
+before any of them. Across 250 cycles, the accumulated wait drops from 111 ticks to 25.
+
+**I/O turnaround — 24% faster**
+
+```
+I/O Turnaround:
+  Round-Robin:  361 ticks
+  MLFQ:         275 ticks   (-86 ticks, -24%)
+```
+
+Because I/O processes spend less time queued behind CPU hogs, their total wall-clock
+completion time is significantly lower. The 86-tick gap is entirely explained by the
+TotalWait reduction (111 → 25 = 86 fewer ticks of waiting).
+
+**CPU turnaround — higher variance in MLFQ, not a flaw**
+
+In Round-Robin, all 8 CPU processes finish within an 8-tick band (189–197). Equal
+shares mean they race to the finish together. In MLFQ, the band widens to 94 ticks
+(112–206). The first two processes finish in 112 and 126 ticks — faster than any
+Round-Robin result — because they get more CPU early before the field is fully demoted.
+At the start of the MLFQ run, all 8 CPU processes sit at priority 0, but only 3 CPUs
+are available. The first 3 initial scan winners get uncontested CPU time — but one slot likely went to an I/O process that slept almost immediately, leaving PIDs 16 and 17 as the two CPU processes that ran with no peer competition until their first demotion. The head start
+compounds through each subsequent demotion boundary. The last process finishes at 206
+ticks, slightly slower than Round-Robin's worst, because by that point everything is
+piled at priority 3 and it is contending with 7 peers for 3 CPUs. The variance is an
+accurate reflection of timing luck under a priority-aware scheduler.
+
+### Conclusion
+
+The benchmark confirms the three core behaviors of MLFQ working correctly in xv6:
+
+1. **CPU hogs are detected and penalized.** Without a single hint from the programmer,
+   every CPU-bound process was demoted to priority 2 or 3 by the time it exited.
+   Round-Robin cannot distinguish them from any other process.
+
+2. **I/O-bound processes are protected.** All four I/O processes exited at priority 1,
+   having never accumulated enough `cpu_time` to be pushed lower. They received
+   preferential scheduling throughout the run.
+
+3. **Lower priority directly translates to lower latency for interactive work.** The
+   4.4× reduction in I/O wait time and 24% reduction in I/O turnaround are direct
+   consequences of I/O processes jumping the queue every time they woke from sleep.
+   In a real system, this is the difference between a shell command that echoes
+   instantly and one that visibly lags while a compile job runs in the background.
 
 ---
 
@@ -356,25 +494,47 @@ vulnerability that is subtle enough to deserve a precise description.
 A process that calls `yield()` — which is a syscall — at the right moment accumulates
 only 1 unit of cpu_time from the syscall entry, not 10 from a timer interrupt. The
 timer fires after the process has already yielded the CPU; its `+10` goes to the next
-running process. The exploit loop: yield just before the tick fires, wake up as RUNNABLE
+running process. The exploit loop: yield just before the tick fires, wake up as `RUNNABLE`
 with minimal cpu_time, get rescheduled immediately, repeat.
 
 ```
-  Timeline of a gaming process:
+  Gaming process (yield just before each tick):
 
-  tick boundary:   0        10       20       30
-                   │        │        │        │
-  cpu_time:        1  1  1  1  1  1  1  1  1  1  ...  (stays near 0 forever)
-                   ↑        ↑        ↑        ↑
-                 yield    yield    yield    yield   ← called just before each tick
-                 +1 only  +1 only  +1 only  +1 only
+  ┌── RUNNING ──┐       ┌── RUNNING ──┐
+  │             │ yield │             │ yield
+──┘             └───────┘             └────────►
+  t=0        t≈9 t=10             t≈19 t=20
+                  │                    │
+              timer fires          timer fires
+              process idle         process idle
+              → no +10             → no +10
 
-  Honest process:
-  cpu_time:        0       10       20       30  ...  → demoted at allotment
-                            ↑        ↑        ↑
-                          timer    timer    timer
-                          +10      +10      +10
+  cpu_time:  0 ────► 1      1 ────► 2    2 ──► ...
+
+  Each yield() costs +1. Timer +10 never lands.
+  Needs 100 yields to reach allotment=100.
+  An honest process takes only 10 timer ticks.
+
+
+  Honest process (runs until preempted by timer):
+
+  ┌──────────────── RUNNING ──────────────────────►
+  │              │              │
+  t=0        timer fires    timer fires
+               t=10            t=20
+               +10              +10
+
+  cpu_time: 0 ─────────► 10 ─────────► 20 ──► ... 100 → DEMOTED
 ```
+
+The current implementation already has a partial mitigation for this: every syscall
+entry charges `cpu_time += 1`. A gaming process that calls `yield()` repeatedly still
+accumulates 1 unit per call, so it cannot stay at priority 0 forever — it just
+accumulates slowly rather than in 10-unit timer jumps. This raises the cost of gaming
+considerably compared to a naive implementation that only charges on timer interrupts.
+It is not a complete fix — a process with the right timing can still game more slowly
+than an honest CPU hog — but it makes the exploit meaningfully harder and is why the
+syscall charge was added to `kernel/trap.c` in the first place.
 
 The correct fix is to measure CPU time in **cycles**, not ticks. The RISC-V `rdcycle`
 CSR provides a 64-bit monotonically increasing cycle counter. Charge the process for
