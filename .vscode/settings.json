@@ -1,0 +1,22 @@
+{
+    "files.associations": {
+        "*.h": "c",
+        "*.c": "c"
+    },
+    "C_Cpp.default.compilerPath": "riscv64-unknown-elf-gcc",
+    "C_Cpp.default.intelliSenseMode": "gcc-x64",
+    "C_Cpp.default.includePath": [
+        "${workspaceFolder}/kernel",
+        "${workspaceFolder}/user"
+    ],
+    "C_Cpp.default.defines": [
+        "__riscv",
+        "__riscv_xlen=64"
+    ],
+    "editor.formatOnSave": false,
+    "files.exclude": {
+        "**/*.o": true,
+        "**/*.d": true,
+        "fs.img": true
+    }
+}

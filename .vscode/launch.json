@@ -1,0 +1,18 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "xv6 Kernel Debug",
+            "type": "gdb",
+            "request": "attach",
+            "executable": "/home/amogh-dev/Dev/systems_learning/OS/xv6/xv6-riscv/kernel/kernel",
+            "target": "localhost:26000",
+            "remote": true,
+            "cwd": "/home/amogh-dev/Dev/systems_learning/OS/xv6/xv6-riscv",
+            "gdbpath": "/usr/bin/gdb-multiarch",
+            "autorun": [
+                "set arch riscv:rv64"
+            ]
+        }
+    ]
+}
