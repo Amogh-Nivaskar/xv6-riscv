@@ -351,6 +351,10 @@ struct thread *alloc_thread(struct thread_family_shared *f)
   }
   release(&thread_list_lock);
 
+  acquire(&f->spinlk);
+  f->tcount++;
+  release(&f->spinlk);
+
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&t->context, 0, sizeof(t->context));
@@ -380,7 +384,7 @@ struct thread_family_shared *alloc_family()
   initlock(&f->spinlk, "family");
   initsleeplock(&f->sleeplk, "family");
 
-  f->tcount = 1;
+  f->tcount = 0;
 
   // An empty user page table.
   f->pagetable = family_pagetable();
@@ -708,10 +712,6 @@ uint64 kclone(uint64 fn, uint64 arg)
   nt->trapframe->epc = fn;
   nt->trapframe->a0 = arg;
 
-  acquire(&myf->spinlk);
-  myf->tcount++;
-  release(&myf->spinlk);
-
   acquire(&nt->lock);
   nt->state = RUNNABLE;
   int nt_tid = nt->tid;
@@ -884,11 +884,14 @@ int kwait(uint64 addr)
           // decremented tcount to 0 but not yet acquired wait_lock to set ZOMBIE.
           // Since we hold wait_lock, it's blocked — sleep to let it proceed.
           int ready = 1;
+          int found_any = 0;
+
           acquire(&thread_list_lock);
           for (struct thread *tt = init_thread; tt != NULL; tt = tt->next)
           {
             if (tt->family == ff)
             {
+              found_any = 1;
               acquire(&tt->lock);
               if (tt->state != ZOMBIE)
                 ready = 0;
@@ -897,7 +900,7 @@ int kwait(uint64 addr)
           }
           release(&thread_list_lock);
 
-          if (!ready)
+          if (!found_any || !ready)
           {
             release(&family_list_lock);
             sleep(f, &wait_lock); // releases wait_lock; dying thread proceeds → sets ZOMBIE → wakeup(f)
