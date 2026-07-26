@@ -98,7 +98,7 @@ int killed(struct thread *);
 void setkilled(struct thread *);
 struct cpu *mycpu(void);
 struct thread *mythread();
-struct thread_family_shared *myfamily();
+struct family_shared *myfamily();
 void procinit(void);
 void scheduler(void) __attribute__((noreturn));
 void sched(void);

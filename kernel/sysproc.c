@@ -63,7 +63,7 @@ sys_sbrk(void)
     // memory, vmfault() will allocate it.
     if (addr + n < addr)
       return -1;
-    struct thread_family_shared *f = mythread()->family;
+    struct family_shared *f = mythread()->family;
     int last_slotIdx = -1;
     acquire(&f->spinlk);
     for (int i = 0; i < NFAMILY_THREADS; i++)

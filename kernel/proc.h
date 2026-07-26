@@ -121,7 +121,7 @@ struct thread
   struct trapframe *trapframe;
   struct context context;
 
-  struct thread_family_shared *family;
+  struct family_shared *family;
   struct thread *next;
 
   char name[16];
@@ -143,7 +143,7 @@ extern struct spinlock thread_list_lock;
 
 extern struct thread *init_thread;
 
-struct thread_family_shared
+struct family_shared
 {
   struct sleeplock sleeplk;
   struct spinlock spinlk;
@@ -155,8 +155,8 @@ struct thread_family_shared
   struct inode *cwd;
   struct vma vmas[NVMA];
 
-  struct thread_family_shared *parent_family;
-  struct thread_family_shared *next;
+  struct family_shared *parent_family;
+  struct family_shared *next;
   int fid;
 
   int xstate;
@@ -169,6 +169,6 @@ struct thread_family_shared
 
 extern struct spinlock family_list_lock;
 
-extern struct thread_family_shared *init_family;
+extern struct family_shared *init_family;
 
 extern int scheduler_type;

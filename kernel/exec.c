@@ -34,7 +34,7 @@ int kexec(char *path, char **argv)
   pagetable_t pagetable = 0, oldpagetable;
   struct vma vmas[NVMA] = {0};
   struct thread *t = mythread();
-  struct thread_family_shared *f = t->family;
+  struct family_shared *f = t->family;
   int nvma = 0;
   int old_slotIdx = t->slot_index;
   struct trapframe *old_trapframe = t->trapframe;

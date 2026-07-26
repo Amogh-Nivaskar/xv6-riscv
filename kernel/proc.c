@@ -10,7 +10,7 @@
 struct cpu cpus[NCPU];
 
 struct thread *init_thread;
-struct thread_family_shared *init_family;
+struct family_shared *init_family;
 
 struct spinlock thread_list_lock;
 struct spinlock family_list_lock;
@@ -28,7 +28,7 @@ struct spinlock fid_lock;
 extern void forkret(void);
 
 static void free_thread(struct thread *td);
-static void free_family(struct thread_family_shared *f);
+static void free_family(struct family_shared *f);
 
 extern char trampoline[]; // trampoline.S
 
@@ -83,12 +83,12 @@ mythread(void)
   return td;
 }
 
-struct thread_family_shared *
+struct family_shared *
 myfamily(void)
 {
   push_off();
   struct cpu *c = mycpu();
-  struct thread_family_shared *fm = c->thread->family;
+  struct family_shared *fm = c->thread->family;
   pop_off();
   return fm;
 }
@@ -176,7 +176,7 @@ void free_kstack(struct thread *t)
 
 int alloc_slot(struct thread *t, pagetable_t pagetable)
 {
-  struct thread_family_shared *family = t->family;
+  struct family_shared *family = t->family;
 
   int old_slotIdx = t->slot_index;
   struct trapframe *old_trapframe = t->trapframe;
@@ -305,7 +305,7 @@ void unmap_slot(int slot_index, pagetable_t pagetable, int do_free)
 // If found, initialize state required to run in the kernel,
 // and return with p->lock held.
 // If there are no free procs, or a memory allocation fails, return 0.
-struct thread *alloc_thread(struct thread_family_shared *f)
+struct thread *alloc_thread(struct family_shared *f)
 {
   struct thread *t;
 
@@ -371,11 +371,11 @@ struct thread *alloc_thread(struct thread_family_shared *f)
   return t;
 }
 
-struct thread_family_shared *alloc_family()
+struct family_shared *alloc_family()
 {
-  struct thread_family_shared *f;
+  struct family_shared *f;
 
-  if ((f = (struct thread_family_shared *)kalloc()) == 0)
+  if ((f = (struct family_shared *)kalloc()) == 0)
   {
     return NULL;
   }
@@ -463,7 +463,7 @@ free_thread(struct thread *t)
 }
 
 static void
-free_family(struct thread_family_shared *f)
+free_family(struct family_shared *f)
 {
   if (f == init_family)
     panic("free_family: attempting to free init_family");
@@ -484,8 +484,8 @@ free_family(struct thread_family_shared *f)
   releasesleep(&f->sleeplk);
 
   acquire(&family_list_lock);
-  struct thread_family_shared *target = init_family->next;
-  struct thread_family_shared *prev_target = init_family;
+  struct family_shared *target = init_family->next;
+  struct family_shared *prev_target = init_family;
 
   while (target != NULL)
   {
@@ -575,7 +575,7 @@ int growproc(int n)
 {
   uint64 sz;
   struct thread *t = mythread();
-  struct thread_family_shared *f = t->family;
+  struct family_shared *f = t->family;
 
   int last_slotIdx = -1;
 
@@ -617,7 +617,7 @@ int kfork(void)
 {
   int i, fid;
   struct thread *nt;
-  struct thread_family_shared *nf;
+  struct family_shared *nf;
   struct thread *t = mythread();
 
   if ((nf = alloc_family()) == NULL)
@@ -692,7 +692,7 @@ int kfork(void)
 uint64 kclone(uint64 fn, uint64 arg)
 {
   struct thread *myt = mythread();
-  struct thread_family_shared *myf = myt->family;
+  struct family_shared *myf = myt->family;
 
   acquire(&myf->spinlk);
   if (myf->no_clone == 1)
@@ -722,9 +722,9 @@ uint64 kclone(uint64 fn, uint64 arg)
 
 // Pass p's abandoned children to init.
 // Caller must hold wait_lock.
-void reparent(struct thread_family_shared *f)
+void reparent(struct family_shared *f)
 {
-  struct thread_family_shared *ff;
+  struct family_shared *ff;
 
   acquire(&family_list_lock);
   for (ff = init_family; ff != NULL; ff = ff->next)
@@ -744,7 +744,7 @@ void reparent(struct thread_family_shared *f)
 void kexit(int status)
 {
   struct thread *t = mythread();
-  struct thread_family_shared *f = t->family;
+  struct family_shared *f = t->family;
 
   acquire(&f->spinlk);
   f->no_clone = 1;
@@ -772,7 +772,7 @@ void kexit(int status)
 void kexit_thread(int status)
 {
   struct thread *t = mythread();
-  struct thread_family_shared *f = t->family;
+  struct family_shared *f = t->family;
 
   if (t == init_thread)
     panic("init exiting");
@@ -853,9 +853,9 @@ void kexit_thread(int status)
 // Return -1 if this process has no children.
 int kwait(uint64 addr)
 {
-  struct thread_family_shared *ff;
+  struct family_shared *ff;
   int havekids, fid;
-  struct thread_family_shared *f = myfamily();
+  struct family_shared *f = myfamily();
 
   acquire(&wait_lock);
 

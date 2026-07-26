@@ -22,7 +22,7 @@ Lets say you have a single process running on a multi-core CPU that needs to run
 The basic idea, is to create a new fundamental mode of execution called `Threads` (or `Tasks` like in Linux) rather than a `Process`. It can be thought of as a Process being made up of multiple Threads. The reason that multiple threads can run in parallel is that a family of threads shares the same Address Space, but has its own independent execution context. Meaning, it can run independently on a core, as if it were its own process. But these threads can also interact with each other, as they share memory and resources.
 
 ### How do we achieve this ?  
-We need to redefine the `struct proc` into a `struct thread` which will have the independent fields needed for a single threads execution context such as thread ID, instruction pointer, user stack, kernel stack, state, family (a pointer to the shared struct) etc. We also create a `struct thread_family_shared` which contains the shared resources between a family of threads such as the page table, the open files, the current working directory inode and the VMAs list (it is used for lazy loading the ELF pages of the program, and hence needs to be in the shared fields). As mentioned above, each thread in a family has a pointer to the same shared struct. We also need to change the virtual memory layout to accommodate a user stack and trapframe for each thread within a single Address Space. 
+We need to redefine the `struct proc` into a `struct thread` which will have the independent fields needed for a single threads execution context such as thread ID, instruction pointer, user stack, kernel stack, state, family (a pointer to the shared struct) etc. We also create a `struct family_shared` which contains the shared resources between a family of threads such as the page table, the open files, the current working directory inode and the VMAs list (it is used for lazy loading the ELF pages of the program, and hence needs to be in the shared fields). As mentioned above, each thread in a family has a pointer to the same shared struct. We also need to change the virtual memory layout to accommodate a user stack and trapframe for each thread within a single Address Space. 
 
 We also need to add three new userspace APIs:
 - `int clone(void (*fn)(void *), void *arg);`
@@ -217,7 +217,7 @@ struct thread {
   struct trapframe *trapframe; 
   struct context context;
   
-  struct thread_family_shared *family;
+  struct family_shared *family;
   struct thread *next;
 
   char name[16];              
@@ -250,7 +250,7 @@ The `next` field is a pointer to the next node in the TCB.
 ### 2. New Thread Family Shared Data Structure
 
 ```c
-struct thread_family_shared {
+struct family_shared {
   struct sleeplock sleeplk;
   struct spinlock spinlk;
 
@@ -261,8 +261,8 @@ struct thread_family_shared {
   struct inode *cwd;
   struct vma vmas[NVMA];
 
-  struct thread_family_shared *parent_family;
-  struct thread_family_shared *next;
+  struct family_shared *parent_family;
+  struct family_shared *next;
   int fid;
 
   int xstate;
@@ -275,14 +275,14 @@ struct thread_family_shared {
 
 struct spinlock family_list_lock;
 
-struct family_thread_shared *init_family;
+struct family_shared *init_family;
 
 ```
-The new `struct thread_family_shared` contains the fields common to a thread family such as the address space via the page table, the heap size (i.e. the top of the heap), the list of open files, the inode pointer to the current working directory and the list of VMAs, needed to lazy load the ELF segments of the program.
+The new `struct family_shared` contains the fields common to a thread family such as the address space via the page table, the heap size (i.e. the top of the heap), the list of open files, the inode pointer to the current working directory and the list of VMAs, needed to lazy load the ELF segments of the program.
 
 [**NOTE:** The sleep lock should be held wherever any kind of page table access needs to be made. So the *existing page table access need to be modified to hold the lock.*]
 
-Each thread in the same family have their `family` pointer pointing to the same `struct thread_family_shared` object.
+Each thread in the same family have their `family` pointer pointing to the same `struct family_shared` object.
 
 `parent_family` is a pointer to the family of the parent thread that spawned this family.
 
@@ -382,7 +382,7 @@ In our notation, `slot_base` is the **bottom** of the guard-page, `ustack_top` i
 
 The heap starts with one page and grows upward via `sbrk()` while thread stack allocation progresses downward, both regions compete for the same free address space. A naïve allocation strategy would allow thread creation to consume all available free space, potentially preventing future heap growth. To avoid this situation, the design introduces a reservation boundary, `HEAP_RESERVE`, within the free address space. New thread stacks may only be allocated above this boundary, ensuring that a portion of the address space remains available for future heap expansion.
 
-`HEAP_RESERVE` is not a hard limit on heap growth. The boundary only constrains stack allocation. If the heap requires additional pages and free space exists above the reservation boundary, it is permitted to grow beyond `HEAP_RESERVE`. In effect, the reservation acts as a one-way constraint: thread stacks may not cross below the boundary, but the heap may grow beyond it when necessary. The `HEAP_RESERVE` address is stored in the `struct thread_family_shared` in field `heap_reserve`. It is computed in `exec()` using the following formula - 
+`HEAP_RESERVE` is not a hard limit on heap growth. The boundary only constrains stack allocation. If the heap requires additional pages and free space exists above the reservation boundary, it is permitted to grow beyond `HEAP_RESERVE`. In effect, the reservation acts as a one-way constraint: thread stacks may not cross below the boundary, but the heap may grow beyond it when necessary. The `HEAP_RESERVE` address is stored in the `struct family_shared` in field `heap_reserve`. It is computed in `exec()` using the following formula - 
 ```c
 heap_reserve = initial_sz + (HEAP_RESERVE_PAGES * PGSIZE)
 ```
@@ -474,7 +474,7 @@ int alloc_slot(struct thread *td)
 ```
 The `alloc_slot()` function will follow these steps:
 
-1. Create variable - `struct thread_family_shared family = td->family;`
+1. Create variable - `struct family_shared family = td->family;`
 2. Mark a slot in the `slot_tracking` array by doing the following:
    1. Acquire the `spinlk` lock on the `family`. 
    2. Find an empty stack slot by looping over `slot_tracking` and finding first index where `slot_tracking[index] == 0`. Lets call this index `slotIdx`. 
@@ -516,7 +516,7 @@ Also, the slot needs to be freed on thread exit.
 void free_slot(struct thread *td);
 ```
 For this we follow these steps:
-1. Create variable - `struct thread_family_shared family = td->family;`
+1. Create variable - `struct family_shared family = td->family;`
 2. Acquire the sleep lock on `family` 
 3. Unmap the stack page from page table, and free the stack page, using `uvmunmap()`.
 4. Unmap the trapframe page from page table, and free the stack page, using `uvmunmap()`.
@@ -587,7 +587,7 @@ For this we follow these steps:
 ### 8. Allocation & Deallocation of a thread
 
 ```c
-int alloc_thread(struct thread_family_shared *family, struct thread **new_thread)
+int alloc_thread(struct family_shared *family, struct thread **new_thread)
 ```
 It is used to create a new thread. Here `family` is the pointer to the to be created thread's family and new thread is a pointer to a pointer to the new thread to be created.
 
@@ -674,12 +674,12 @@ This is achieved by doing the following:
 ### 9. Allocation & Deallocation of a thread's family
 
 ```c
-struct thread_family_shared* alloc_family()
+struct family_shared* alloc_family()
 ```
 This function allocates a family and returns a pointer to it.
 
 This is achieved by doing the following: 
-1. Allocate memory for shared family object - `struct thread_family_shared *family = kalloc();`. On failure go to *Step 6*.
+1. Allocate memory for shared family object - `struct family_shared *family = kalloc();`. On failure go to *Step 6*.
 2. Assign calling thread's family as parent - `family->parent = mythread()->family`
 3. Initialize empty user page table - `family->pagetable = thread_pagetable()`. On failure go to *Step 6*.
 4. Zero initialze some family fields - 
@@ -697,7 +697,7 @@ This is achieved by doing the following:
    if (init_family == NULL){
       init_family = family;
    }else{
-      struct thread_family_shared prev_first = init_family->next;
+      struct family_shared prev_first = init_family->next;
       init_family->next = family;
       family->next = prev_first;
    }
@@ -711,7 +711,7 @@ This is achieved by doing the following:
 
 
 ```c
-void free_family(struct thread_family_shared *family)
+void free_family(struct family_shared *family)
 ```
 This function frees the family object. 
 
@@ -731,8 +731,8 @@ This is achieved by doing the following:
    1. Acquire FCB lock - `aquire(family_list_lock);`
    2. Loop over the TCB to find the family's node (`target`) and also the node just before it (`prev_target`):
       ```c
-      struct thread_family_shared *target = init_family->next;
-      struct thread_family_shared *prev_target = init_family;
+      struct family_shared *target = init_family->next;
+      struct family_shared *prev_target = init_family;
       
       while (target != NULL){
          if (target->fid == family.fid) break;
@@ -761,7 +761,7 @@ int clone(void (*fn)(void *), void *arg)
 It creates a new thread and runs the function `fn` with arguments `arg`.  
 
 To achieve this, it does the following:
-1. Access calling thread's family - `struct thread_family_shared *family = mythread()->family;`
+1. Access calling thread's family - `struct family_shared *family = mythread()->family;`
 2. Check if cloning is allowed:
    1. Acquire spin lock `spinlk` on family
    2. If `family->no_clone == 1`, release lock and return -1
@@ -787,7 +787,7 @@ It is called by a thread when it wants to delete itself and is passed in a statu
 
 To achieve this, it does the following:
 1. Access calling thread - `struct thread *td = mythread()`
-2. Access calling thread's family - `struct thread_family_shared *family = td->family;`
+2. Access calling thread's family - `struct family_shared *family = td->family;`
 3. Decrement threads count:
    1. Acquire spin lock `spinlk` on family.
    2. Decrement threads counter - `family->tcount -= 1`
@@ -832,7 +832,7 @@ It is called by a thread to exit its entire family.
 
 It achieves this by doing the following:
 1. Access calling thread - `struct thread *td = mythread()`
-2. Access calling thread's family - `struct thread_family_shared *family = td->family;`
+2. Access calling thread's family - `struct family_shared *family = td->family;`
 3. Turn off cloning:
    1. Acquire the spin lock on the family
    2. Turn off cloning - `family->no_clone = 1`
@@ -866,8 +866,8 @@ It copies the calling thread's virtual memory, family state and thread state int
 
 It achieves this by doing the following:
 1. Create instance of calling thread - `struct thread *calltd = mythread()`
-2. Create instance of calling thread's family - `struct thread_family_shared *callfamily = calltd->family`
-3. Create instance of `td`'s family - `struct thread_family_shared *family = td->family`.
+2. Create instance of calling thread's family - `struct family_shared *callfamily = calltd->family`
+3. Create instance of `td`'s family - `struct family_shared *family = td->family`.
 4. Acquire locks on both families, ordered by address to avoid deadlocks
    ```c
    if (callfamily < family){
@@ -983,7 +983,7 @@ The calling thread's slot is reused for the new program's slot, so no new slot a
 It creates a new family with a new thread with the same execution state as the parent family and calling thread.
 
 It makes use of a few functions that we have already defined to make this easier.
-It creates a new family - `struct thread_family_shared *family = alloc_family()`.
+It creates a new family - `struct family_shared *family = alloc_family()`.
 It then creates a new thread - `struct thread *td = alloc_thread(family)`.
 Then it uses `copy_state_thread(td)` which copies the calling thread's virtual memory, family state and thread state into the new thread `td`.
 
@@ -1071,7 +1071,7 @@ The correctness check (all three runs finding 17,984 primes) verifies that share
 ## Alternatives Considered
 
 ### 1. Spin lock vs sleep lock for shared family fields
-We considered using spinlocks for all fields in thread_family_shared for simplicity. However, as detailed in the [Thread Family Shared Data Structure](#2-new-thread-family-shared-data-structure) section, operations on pagetable, ofile, cwd and vmas can involve disk I/O which requires sleeping. Holding a spinlock while sleeping causes deadlock since interrupts are disabled. Hence sleep locks were chosen for these fields.
+We considered using spinlocks for all fields in family_shared for simplicity. However, as detailed in the [Thread Family Shared Data Structure](#2-new-thread-family-shared-data-structure) section, operations on pagetable, ofile, cwd and vmas can involve disk I/O which requires sleeping. Holding a spinlock while sleeping causes deadlock since interrupts are disabled. Hence sleep locks were chosen for these fields.
 
 ### 2. User-managed stacks in `clone()`
 Linux's definition for `clone()` looks something like this:
