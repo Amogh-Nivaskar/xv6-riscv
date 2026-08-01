@@ -39,7 +39,7 @@ This does run the two halves on different CPUs. But it breaks the moment you wan
 
 The key thing that doesn't work: our benchmark uses a shared `partial[]` array. Each worker writes its count to `partial[id]` and the main thread sums them at the end. With `fork()`, parent and child have separate address spaces. The child's write to `partial[1]` is invisible to the parent. There is no shared `partial[]`. You have to serialize everything through the pipe.
 
-That's fine for this benchmark — the result is one `uint64`. But it fundamentally can't work for anything that needs a live shared pointer: a shared counter, a work queue, a lock-protected data structure. With separate address spaces, any shared pointer is meaningless after `fork()`.
+For this specific benchmark, the pipe approach technically works — each child sends back one prime count, and the parent sums them. The pipe carries a single integer. But it fundamentally can't work for anything that needs a live shared pointer: a shared counter, a work queue, a lock-protected data structure. With separate address spaces, any shared pointer is meaningless after `fork()`.
 
 Even for simple result sharing, the cost adds up. A pipe round-trip in xv6 is 2–3 context switches plus a kernel buffer copy. For fine-grained work sharing, this serializes exactly what you wanted to parallelize.
 
@@ -159,7 +159,7 @@ So we do all the failure-prone work first: parse the ELF, allocate the new page 
 Every trap entry goes through `trampoline.S`. The original code has two instructions at the very top of `uservec`:
 
 ```asm
-csrw sscratch, a0      # save user a0 (we're about to clobber it)
+csrw sscratch, a0      # save user a0 register (we're about to overwrite it)
 li a0, TRAPFRAME       # load hardcoded trapframe VA into a0
 ```
 
@@ -171,7 +171,7 @@ The problem: `TRAPFRAME` is a hardcoded address. There's only one. But now, each
 
 We use a two-part protocol.
 
-**Part 1:** `prepare_return()` (which runs before every return to user space) writes the current thread's trapframe VA into `sscratch`:
+**Part 1:** `prepare_return()` (which runs before every return to user space) writes the current thread's trapframe VA into `sscratch` register:
 
 ```c
 w_sscratch(TRAPFRAME_BASE(mythread()->slot_index));
@@ -238,9 +238,6 @@ Getting clean parallel measurements on QEMU is trickier than it sounds. There ar
 
 **QEMU MTTCG**: By default, QEMU's TCG emulator serializes all vCPUs onto a single host thread. Adding `-accel tcg,thread=multi` maps each vCPU to a real host OS thread. When two vCPUs are both `RUNNING`, they genuinely execute in parallel on different host cores.
 
-**RR scheduler**: With MLFQ (our default), idle CPUs execute `wfi` (Wait-For-Interrupt). WFI halts the CPU until the next timer interrupt, which fires roughly every ~100ms. So when you clone a sibling thread, the idle CPU won't pick it up for up to 100ms — making the "parallel" run look almost identical to serial. We call `setscheduler(0)` at the start of the benchmark to switch to Round Robin, where idle CPUs spin continuously. With RR, an idle CPU sees a newly `RUNNABLE` thread within a few thousand cycles.
-
-**The rdcycle migration bug**: `rdcycle` reads the cycle counter of the *current* vCPU. With MTTCG, each vCPU has an independent counter with a different base. If `join()` inside the timed region causes the main thread to sleep and wake on a *different* vCPU, `t1 - t0` wraps to UINT64_MAX. The fix: each sibling sets a `done[i]` flag right before `exit_thread()`, and the main thread spin-waits on those flags before reading `t1`. This keeps the main thread awake and on the same vCPU the whole time. `join()` is called after `t1` is recorded, outside the timing window, purely for TCB cleanup.
 
 ### Results
 
@@ -263,30 +260,6 @@ The correctness check — all three configurations finding exactly 17,984 primes
 ---
 
 ## What We'd Do Differently
-
-### The tcount race bug
-
-`alloc_family()` originally initialized `tcount = 1` as a sentinel, with `kclone()` incrementing it for additional threads.
-
-The bug: between `alloc_family()` inserting the family into the FCB and `alloc_thread()` being called, there's a window where `tcount == 0` and no threads exist yet. If `kwait()` runs during this window, it sees `tcount == 0` with no ZOMBIE threads and concludes the family is dead — freeing it while `fork()` is still setting it up.
-
-The fix: move the increment into `alloc_thread()` and add a `found_any` guard in `kwait()`. A legitimately dead family always has at least one ZOMBIE thread (the last thread sets itself ZOMBIE before decrementing `tcount`). The zero-thread case is exclusively the setup window. So if `kwait()` finds a family with no threads at all, it sleeps and retries rather than freeing it.
-
-```c
-int found_any = 0;
-for (struct thread *tt = init_thread; tt != NULL; tt = tt->next) {
-    if (tt->family == ff) {
-        found_any = 1;      // any thread in this family, regardless of state
-        acquire(&tt->lock);
-        if (tt->state != ZOMBIE) ready = 0;
-        release(&tt->lock);
-    }
-}
-// !found_any means the setup window — sleep and retry
-if (!found_any || !ready) { sleep(...); }
-```
-
-This kind of bug is subtle because the race window is tiny and you only see it under specific scheduling patterns.
 
 ### The sleeplock bottleneck
 
