@@ -98,9 +98,36 @@ Given an index (idx), the range of inode nums covered in the imap at its block a
 In our design, since 1 inode takes up one block, we don't need any offset to find it. Just the block address is sufficient. Hence the imap is just an array of 4 byte inode block addresses.
 
 Once we have the imap block containing the inode block address, we find the inode block address by offsetting in imap block by - 
-   I % 256
+   i % 256
 
 
 Thus we have found the block address of an inode, for a given inode number.
+
+
+## Segments structure
+
+Now that we have seen how to read a file data block, we can design the write path, but before that lets see how a segment is designed in the first place as that info is important in the writing of data in a segment.
+
+A segment has 100 blocks. The first block will always be the segment summary block, which will have, for each block two 4 byte fields. These 2 fields will have different meanings according to their values as they will be used to distinguish between the 4 types of blocks present in the segments - imap blocks, segment summary blocks (a segment can have more than one segment summary block), inode block, file data block.
+
+   Block type     | 1st 4 bytes      |     2nd 4 bytes
+---------------------------------------------------------------------------------
+imap block        |     0            |     imap block addrs array index + 1
+                  |                  |
+seg sum block     |     0            |        0
+                  |                  |
+inode block       |   inode num      |        0
+                  |                  |
+file data block   |   inode num      |    file data block num 1 indexed
+
+
+Lets understand what is going on for each of these blocks and how to find out if these blocks are live or not.
+
+A) Imap block - since imap blocks don't belong to any particular file, the first 4 bytes are 0 and 2nd 4 bytes are the index value of the imap block addrs array in the checkpoint region, which points to this imap block.
+
+To check for liveness, we can see the address in the index mentioned in segment summary block and if they match then its alive, else its dead.
+
+B) Segment summary block - A segment summary block has both blocks as 0, hence it can be mistaken as empty, but we can work around it. For 1st block of a segment, if its value in segment summary block is full 0, but its next entries have values, then its not empty. Also
+
 
 
