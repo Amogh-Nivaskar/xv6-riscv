@@ -71,6 +71,36 @@ Hence Reserved Blocks = boot block + super blocks + checkpoint region 1 + checkp
                       = 1 + 1 + 2 + 2 = 6 blocks
 
 
+## Find an inode block from an inode number
 
+We will work with 1 inode per block.
+
+No. of inodes per imap block = 256
+
+Hence, the imap block addresses in checkpoint regions will be like this - 
+
+   Inode Num Range     Imap block address
+  ---------------------------------------
+   0 - 255              Addr 1
+   256 - 511            Addr 2
+   512 - 767            Addr 3
+       .                   .
+       .                   .
+       .                   .  
+
+
+So, given an inode number (i), we can find the index to get its imap block address like this -
+   imap_index = i // 256
+
+Given an index (idx), the range of inode nums covered in the imap at its block address can be found like this - 
+   [idx * 256, (idx + 1) * 256 - 1]
+
+In our design, since 1 inode takes up one block, we don't need any offset to find it. Just the block address is sufficient. Hence the imap is just an array of 4 byte inode block addresses.
+
+Once we have the imap block containing the inode block address, we find the inode block address by offsetting in imap block by - 
+   I % 256
+
+
+Thus we have found the block address of an inode, for a given inode number.
 
 
