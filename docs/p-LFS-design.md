@@ -42,21 +42,23 @@ All the other info can be derived.
 The checkpoint region will contain - 
  - Last update timestamp
  - Segment number of the last updated segment
+ - Segment Fill offset
  - imap blocks address array
  - Segment usage table i.e. for each segment it records num of live blocks and most recent modified time of any block in segment
 
 The layout of the checkpoint region is as follows:
  - Last update timestamp - 4 bytes
  - Segment number of the last updated segment - 4 bytes
+ - Segment fill offset block index - 4 bytes
  - For imap block address array - 
     1 block = 1024 bytes
     block address = 4 bytes
 
     Hence, no. of inodes per imap block = 1024 / 4 = 256
 
-    Space left in checkpoint block = 1024 - 4 - 4 = 1016
+    Space left in checkpoint block = 1024 - 4 - 4 - 4 = 1012
 
-    Total no. of inodes = 1016 / 4 x 256 = 65024
+    Total no. of inodes = 1012 / 4 x 256 = 64,768
     
  - For SUT - 
     No. of live blocks - 4 bytes
@@ -81,24 +83,24 @@ Hence, the imap block addresses in checkpoint regions will be like this -
 
    Inode Num Range     Imap block address
   ---------------------------------------
-   0 - 255              Addr 1
-   256 - 511            Addr 2
-   512 - 767            Addr 3
+   1 - 256              Addr 1
+   257 - 512            Addr 2
+   513 - 768            Addr 3
        .                   .
        .                   .
        .                   .  
 
 
 So, given an inode number (i), we can find the index to get its imap block address like this -
-   imap_index = i // 256
+   imap_index = (i-1) // 256
 
 Given an index (idx), the range of inode nums covered in the imap at its block address can be found like this - 
-   [idx * 256, (idx + 1) * 256 - 1]
+   [idx * 256 + 1, (idx + 1) * 256]
 
 In our design, since 1 inode takes up one block, we don't need any offset to find it. Just the block address is sufficient. Hence the imap is just an array of 4 byte inode block addresses.
 
 Once we have the imap block containing the inode block address, we find the inode block address by offsetting in imap block by - 
-   i % 256
+   (i-1) % 256
 
 
 Thus we have found the block address of an inode, for a given inode number.
@@ -108,7 +110,7 @@ Thus we have found the block address of an inode, for a given inode number.
 
 Now that we have seen how to read a file data block, we can design the write path, but before that lets see how a segment is designed in the first place as that info is important in the writing of data in a segment.
 
-A segment has 100 blocks. The first block will always be the segment summary block, which will have, for each block two 4 byte fields. These 2 fields will have different meanings according to their values as they will be used to distinguish between the 4 types of blocks present in the segments - imap blocks, segment summary blocks (a segment can have more than one segment summary block), inode block, file data block.
+A segment has 512 blocks. The first block will always be the segment summary block, which will have, for each block two 4 byte fields. These 2 fields will have different meanings according to their values as they will be used to distinguish between the 4 types of blocks present in the segments - imap blocks, segment summary blocks (a segment can have more than one segment summary block), inode block, file data block.
 
    Block type     | 1st 4 bytes      |     2nd 4 bytes
 ---------------------------------------------------------------------------------
@@ -127,7 +129,17 @@ A) Imap block - since imap blocks don't belong to any particular file, the first
 
 To check for liveness, we can see the address in the index mentioned in segment summary block and if they match then its alive, else its dead.
 
-B) Segment summary block - A segment summary block has both blocks as 0, hence it can be mistaken as empty, but we can work around it. For 1st block of a segment, if its value in segment summary block is full 0, but its next entries have values, then its not empty. Also
+B) Segment summary block - A segment summary block has both blocks as 0, hence it can be mistaken as empty, but we can work around it. The checkpoint header stores the currently being written segment's segment number and filled offset, and we know that at any given time only the currently written segment can be partially written. Every other segment must be either full or empty (untouched).
+
+ So when a segment is partially filled, its segment summary block is also partially filled as all entries after last filled offset are full zero and this never changes as even if the segment is filled in later, its block related info is filled in another segment summary block. But if we do find such a segment where the primary segment summary block has many full zero entries, and we know that this isn't the current active segment, then we can always conclude that the first full zero entry in the primary segment summary block is another segment summary block.
+
+ Also, we can always know whether a segment is empty or not by referring to the live blocks for segment in the SUT, as live blocks for empty segment will always be 0.
+
+C) Inode block - 1st 4 bytes are the inode number of the file and the 2nd 4 bytes are 0 in the segment summary block entry. To check livenes, we use the inode number value to find the inode block address via the imap and then compare this found address to the address of current block. If they match, it means it is live, else its dead.
+
+D) File Data block - 1st 4 bytes are the inode number of the file and the 2nd 4 bytes is the position in the file, in the segment summary block entry. To check livenes, we use the inode number value to find the inode block address via the imap and then check if the block address for file block position given in the inode block matches with the current block, if they do then its alive, else its dead.
+
+
 
 
 
