@@ -135,9 +135,15 @@ B) Segment summary block - A segment summary block has both blocks as 0, hence i
 
  Also, we can always know whether a segment is empty or not by referring to the live blocks for segment in the SUT, as live blocks for empty segment will always be 0.
 
+ Since a segment has 512 blocks, and a segment summary block can cover only 1024 / (4+4) = 128 blocks, then at minimum a segment will need 4 segment summary blocks (assuming each segment summary block is full). The rule will be that a segment summary block will be directly followed by all the blocks it represents. For eg: if we want to flush the entire segment at once, it will be structured like - 1st segment summary block, followed by its respective 127 blocks, 2nd segment summary block, followed by its respective 127 blocks, so on and so forth. 
+ For another example, lets take a case of partial writes. Lets say we want to flush 150 blocks, then in this case the segment structure will look like - 1st segment summary block (fully filled), followed by its 127 blocks, 2nd segment summary block (only filled 22 entries, rest are full zero), followed by its respective 21 blocks (excluded 1 block for this 2nd flush's segment summary block). Now when we want to flush again, lets say 100 blocks, we again append a new segment summary block filled with 100 entries, followed by its respective 100 blocks. 
+
 C) Inode block - 1st 4 bytes are the inode number of the file and the 2nd 4 bytes are 0 in the segment summary block entry. To check livenes, we use the inode number value to find the inode block address via the imap and then compare this found address to the address of current block. If they match, it means it is live, else its dead.
 
 D) File Data block - 1st 4 bytes are the inode number of the file and the 2nd 4 bytes is the position in the file, in the segment summary block entry. To check livenes, we use the inode number value to find the inode block address via the imap and then check if the block address for file block position given in the inode block matches with the current block, if they do then its alive, else its dead.
+
+
+## Write Path
 
 
 
