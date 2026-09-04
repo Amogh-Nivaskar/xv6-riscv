@@ -145,6 +145,50 @@ D) File Data block - 1st 4 bytes are the inode number of the file and the 2nd 4 
 
 ## Write Path
 
+The basic algorithm for in-memory write will be like this - 
+1) Append data to segment
+2) Append inode block to segment
+3) Append imap block to segment
+4) Update segment summary
+5) Update imap block address array in checkpoint region
+6) Update segment usage table in Checkpoint region
+7) Update timestamp, last updated segment number and segment offset in Checkpoint region
+
+The checkpoint region is just within 2 blocks i.e. 2 kb and hence can easily fit in a 4 kb page. So we can just create a struct for checkpoint region like this - 
+
+uint region_num; // global variable denoting which region (1 or 2) the current struct checkpoint is representing
+
+#define IMAP_BLK_NUM = 64768 / 256 = 253
+#define SEG_NUM = 100
+
+struct checkpoint {
+   uint timestamp;
+   uint segment_num; 
+   uint fill_offset;
+   uint imap_addr[IMAP_BLK_NUM];
+   sut_entry sut[SEG_NUM]  
+}
+
+struct sut_entry {
+   uint live_count;
+   uint last_mod_time;
+}
+
+
+Storing the Segment in-memory is not so straight forward, as a page is just 4 kb and the segment is 512 kb in size. Hence, what we do is we store pointers to the pages having the segment blocks. We need 512 / 4 = 128 pages to store the full segment. Thus with 4 byte address, we will need 4 x 128 = 512 bytes for full pointer array.
+
+struct seg_buf {
+  int valid;   // has data been read from disk?
+  int disk;    // does disk "own" buf?
+  uint dev;
+  uint segno;
+  struct sleeplock lock;
+  uint refcnt;
+  uint addrs[128]; // stores the address of the pages which store the actual segment blocks
+};
+
+
+
 
 
 
