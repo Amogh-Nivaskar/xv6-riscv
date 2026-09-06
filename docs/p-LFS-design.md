@@ -156,10 +156,11 @@ The basic algorithm for in-memory write will be like this -
 
 The checkpoint region is just within 2 blocks i.e. 2 kb and hence can easily fit in a 4 kb page. So we can just create a struct for checkpoint region like this - 
 
-uint region_num; // global variable denoting which region (1 or 2) the current struct checkpoint is representing
+`uint region_num;` // global variable denoting which region (1 or 2) the current struct      checkpoint is representing
 
-#define IMAP_BLK_NUM = 64768 / 256 = 253
-#define SEG_NUM = 100
+`#define IMAP_BLK_NUM = 253` // 64768 / 256 = 253
+`#define SEG_NUM = 100`
+
 
 struct checkpoint {
    uint timestamp;
@@ -183,9 +184,29 @@ struct seg_buf {
   uint dev;
   uint segno;
   struct sleeplock lock;
-  uint refcnt;
-  uint addrs[128]; // stores the address of the pages which store the actual segment blocks
+  uint64 addrs[128]; // stores the address of the pages which store the actual segment blocks
+                   // each page will store 4 blocks as one block is of 1 kb and hence 
+                   // indexing them is pretty straight forward
 };
+
+We maintain a cache for dirty imap, inode, indirect address and data blocks, and we update them in-place. When flushing, we construct the `addrs` array by walking over all the dirty data blocks first and append them to addrs, then use their final physical address to update their respective inode blocks and indirect blocks (if any) and append them to `addrs` array and then finally update the imap blocks with the final physical addresses of the inode blocks and append them to the `addrs` array as well.
+Then finally we update the `checkpoint.imap_addr` array, SUT and fill_offset.
+
+Each of the caches will have their own spin locks as guards during in-memory updates and there will be a global flush lock, which will guard all caches against update during the flush mechanism.
+
+
+DRIVER CHANGES:-
+
+A problem that becomes apparent is that the current driver code (`virtio_disk_rw()`) only write a single block in one operation, while we want to write multiple contiguous blocks in one single operation.
+
+To solve this, we change the way descriptor chains are used in the driver.
+
+We first introduce a field of `virtq_desc indirect_table[514]` static array in `struct disk`. We do this because we know that any write operation will at most have 514 chained descriptors (512 for full segment blocks + header + status) and thus we can explicitly initialize these in the data region so that we don't have to go through the hassel of allocating memory for them via `kalloc()`.
+
+Now for a write operation, each descriptor in `desc` array will actually be an indirect pointer to the Header descriptor (belonging to `indirect_table` array), which itself will point to a chain of segment block descriptors and end with the status descriptor.
+
+The read operations work just as they did earlier.
+
 
 
 
