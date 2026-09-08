@@ -207,8 +207,27 @@ Now for a write operation, each descriptor in `desc` array will actually be an i
 
 The read operations work just as they did earlier.
 
+# writei() implementation:
+
+We will first find the data block at the offset by walking the checkpoint imap addr array -> imap block -> inode block -> indirect block (possibly) read from dirty caches (if not available then from disk). If it exists and is not present in dirty data blocks cache, we read it from disk and add to cache. If it is present in cache we just directly read it from cache. If it doesn't exist, we allocate a new page for this data block.
+
+Then we start iterating over the `src` address for `n` bytes to copy the data by breaking it down into block aligned steps. For each step, we check if it is available in the cache or else we read it from disk. Then if the step write address isn't block aligned or if the data to be written doesn't end block aligned, then we merge the new content with the old existing block content.
 
 
+## Read Path
+
+Read path's `readi()` is quite similar to the write path covered above in detail.
+
+## Inode Allocation
+
+The checkpoint region's imap address array is in ascending order of inode numbers.
+We keep a in-memory cache map of the number of empty inode numbers for each imap block.
+
+When we need to allocate an inode, we start we loop over each imap address in checkpoint region. For each imap address, we check in the in-memory cache map to check if the current imap block is present in the cache, if it is, and it has empty inode numbers, then we loop over the imap block to find the first empty inode number. If it is present, but there are no empty inode numbers, then we skip this imap and move to the next. If it is not present at all, then we loop over the full imap block, note the first empty inode number if we find it, and count the number of empty inode numbers in the imap block. Then we add this count to the cache map.
+
+It is important to note that for every inode allocated or freed i.e. in `ialloc()` and `ifree()`, we must increament and decreament the free inode number count value respectively, for that particular imap block if it is present in the empty-count cache.
+
+Once we find an empty inode number, we first mark it occupied. On-disk, the imap block should have the physical address of the inode block, but here we aren't allocating physical addresses to inode blocks until flush, hence we need to mark it occupied using a sentinal value of `0xFFFFFFFF`. Then we allocate a page of memory for the `struct inode` with the occupied inode number value, and the passed in type. Then lastly we add this inode in the in-memory dirty inode cache.
 
 
 
