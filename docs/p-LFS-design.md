@@ -129,7 +129,7 @@ A) Imap block - since imap blocks don't belong to any particular file, the first
 
 To check for liveness, we can see the address in the index mentioned in segment summary block and if they match then its alive, else its dead.
 
-B) Segment summary block - A segment summary block has both blocks as 0, hence it can be mistaken as empty, but we can work around it. The checkpoint header stores the currently being written segment's segment number and filled offset, and we know that at any given time only the currently written segment can be partially written. Every other segment must be either full or empty (untouched).
+B) Segment summary block - A segment summary block has both bytes as 0, hence it can be mistaken as empty, but we can work around it. The checkpoint header stores the currently being written segment's segment number and filled offset, and we know that at any given time only the currently written segment can be partially written. Every other segment must be either full or empty (untouched).
 
  So when a segment is partially filled, its segment summary block is also partially filled as all entries after last filled offset are full zero and this never changes as even if the segment is filled in later, its block related info is filled in another segment summary block. But if we do find such a segment where the primary segment summary block has many full zero entries, and we know that this isn't the current active segment, then we can always conclude that the first full zero entry in the primary segment summary block is another segment summary block.
 
@@ -167,6 +167,7 @@ struct checkpoint {
    uint fill_offset;
    uint imap_addr[IMAP_BLK_NUM];
    sut_entry sut[SEG_NUM];
+   uint global_seq;
    uint timestamp; 
 }
 
@@ -240,7 +241,8 @@ For this, we simply pick the checkpoint region with the latest timestamp as the 
 Note: Here we are assuming that QEMU's virtio-blk device processes descriptor chains and copies their buffer contents strictly in sequential address order.
 
 ### 2. Roll-forward start:
-We know where to start roll-forward from the `fill_offset` in `segment_num` segment, but since the checkpoint is flushed much less frequently than segment flushes, then it is entirely possible that more than one segments have been flushed before the crash. Hence we will be keeping a free-list of segments, so that we know which segment was chosen to populate after `segment_num` segment. This free-list is initially created in `mkfs` and then updated during segment allocation and garbage collection.   
+We know where to start roll-forward from the `fill_offset` in `segment_num` segment, but since the checkpoint is flushed much less frequently than segment flushes, then it is entirely possible that more than one segments have been flushed before the crash. We will be keeping a free-list of segments, which is initially created in `mkfs` and then updated during segment allocation and garbage collection. 
+So to track the sequence of segments writes, we keep the first 4 byte entry of the segment summary block as a sequence value `seq` and its following segment having sequence value of `seq + 1`, so on and so forth. The checkpoint region also has a `global_seq` field which tracks the current ongoing segment's `seq` value. Hence, we can just follow an ascending order of sequence value to know the sequence of the segments that were populated
 
 ### 3. Roll-forward end:
 We need to know if the flushed group of blocks was completed properly or not. For this, for each segment summary block (covering 128 blocks), we keep 2 checksums, one is a self checksum to confirm that the segment summary block itself is valid and second is a checksum of all the blocks covered by the segment summary block called the data checksum. If either the self checksum or the data checksum fails for a group, then we stop the roll-forward there itself.
