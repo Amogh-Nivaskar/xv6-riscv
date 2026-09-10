@@ -163,11 +163,11 @@ The checkpoint region is just within 2 blocks i.e. 2 kb and hence can easily fit
 
 
 struct checkpoint {
-   uint timestamp;
    uint segment_num; 
    uint fill_offset;
    uint imap_addr[IMAP_BLK_NUM];
-   sut_entry sut[SEG_NUM]  
+   sut_entry sut[SEG_NUM];
+   uint timestamp; 
 }
 
 struct sut_entry {
@@ -207,7 +207,7 @@ Now for a write operation, each descriptor in `desc` array will actually be an i
 
 The read operations work just as they did earlier.
 
-# writei() implementation:
+### writei() implementation:
 
 We will first find the data block at the offset by walking the checkpoint imap addr array -> imap block -> inode block -> indirect block (possibly) read from dirty caches (if not available then from disk). If it exists and is not present in dirty data blocks cache, we read it from disk and add to cache. If it is present in cache we just directly read it from cache. If it doesn't exist, we allocate a new page for this data block.
 
@@ -231,5 +231,18 @@ Once we find an empty inode number, we first mark it occupied. On-disk, the imap
 
 
 
+## Crash Recovery
+
+### 1. Picking base checkpoint region:
+Once a crash occurs, we need to decide which of the 2 checkpoint regions to consider as base, since it is possible that a checkpoint region was being written when the crash occured and thus has partial data.
+For this, we simply pick the checkpoint region with the latest timestamp as the base as we know that the timestamp is the last written byte in the checkpoint region, by virtue of it being placed last in the `struct checkpoint`. Also, since the DMA always writes bytes sequentially, (we use a 4 descriptor chain for writing the checkpoint region to disk - 1 header, 2 data blocks, 1 status) we can be confident that if the timestamp was written then the other fields in the checkpoint region were written succesfully as well.
+
+Note: Here we are assuming that QEMU's virtio-blk device processes descriptor chains and copies their buffer contents strictly in sequential address order.
+
+### 2. Roll-forward start:
+We know where to start roll-forward from the `fill_offset` in `segment_num` segment, but since the checkpoint is flushed much less frequently than segment flushes, then it is entirely possible that more than one segments have been flushed before the crash. Hence we will be keeping a free-list of segments, so that we know which segment was chosen to populate after `segment_num` segment. This free-list is initially created in `mkfs` and then updated during segment allocation and garbage collection.   
+
+### 3. Roll-forward end:
+We need to know if the flushed group of blocks was completed properly or not. For this, for each segment summary block (covering 128 blocks), we keep 2 checksums, one is a self checksum to confirm that the segment summary block itself is valid and second is a checksum of all the blocks covered by the segment summary block called the data checksum. If either the self checksum or the data checksum fails for a group, then we stop the roll-forward there itself.
 
 
