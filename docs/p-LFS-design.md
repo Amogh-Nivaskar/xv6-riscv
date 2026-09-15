@@ -146,13 +146,14 @@ D) File Data block - 1st 4 bytes are the inode number of the file and the 2nd 4 
 ## Write Path
 
 The basic algorithm for in-memory write will be like this - 
-1) Append data to segment
-2) Append inode block to segment
-3) Append imap block to segment
-4) Update segment summary
-5) Update imap block address array in checkpoint region
-6) Update segment usage table in Checkpoint region
-7) Update timestamp, last updated segment number and segment offset in Checkpoint region
+1) For each data, inode and imap block about to be written, find its current on-disk address (if any) by walking the imap chain (`imap_addr[idx]` directly for an imap block; `imap_addr[idx]` → imap block entry for an inode block; `imap_addr[idx]` → imap block → inode's `addrs[position]` for a data block), and if a valid old address was found, decrement the live block count (in the SUT) of whichever segment held it. This must happen before any of the pointers below are overwritten. Segment summary blocks are excluded from this step, as they never supersede a prior version.
+2) Append data to segment
+3) Append inode block to segment
+4) Append imap block to segment
+5) Update segment summary
+6) Update imap block address array in checkpoint region, for every imap block written
+7) Update segment usage table in Checkpoint region, incrementing the live block count of the current segment for every data, inode and imap block newly written into it
+8) Update timestamp, last updated segment number and segment offset in Checkpoint region
 
 The checkpoint region is just within 2 blocks i.e. 2 kb and hence can easily fit in a 4 kb page. So we can just create a struct for checkpoint region like this - 
 
@@ -191,7 +192,8 @@ struct seg_buf {
 };
 
 We maintain a cache for dirty imap, inode, indirect address and data blocks, and we update them in-place. When flushing, we construct the `addrs` array by walking over all the dirty data blocks first and append them to addrs, then use their final physical address to update their respective inode blocks and indirect blocks (if any) and append them to `addrs` array and then finally update the imap blocks with the final physical addresses of the inode blocks and append them to the `addrs` array as well.
-Then finally we update the `checkpoint.imap_addr` array, SUT and fill_offset.
+
+Before any of this happens, for every dirty block being flushed we look up its current on-disk address (if it has one) via the imap chain and decrement the live block count of whichever segment holds it — this is the same superseding logic used during crash recovery replay (see Replay semantics, steps 1-2). Once the block is written to its new location, we increment the live block count of the segment it now lives in. Then finally we update the `checkpoint.imap_addr` array, SUT and fill_offset.
 
 Each of the caches will have their own spin locks as guards during in-memory updates and there will be a global flush lock, which will guard all caches against update during the flush mechanism.
 
@@ -242,9 +244,47 @@ Note: Here we are assuming that QEMU's virtio-blk device processes descriptor ch
 
 ### 2. Roll-forward start:
 We know where to start roll-forward from the `fill_offset` in `segment_num` segment, but since the checkpoint is flushed much less frequently than segment flushes, then it is entirely possible that more than one segments have been flushed before the crash. We will be keeping a free-list of segments, which is initially created in `mkfs` and then updated during segment allocation and garbage collection. 
-So to track the sequence of segments writes, we keep the first 4 byte entry of the segment summary block as a sequence value `seq` and its following segment having sequence value of `seq + 1`, so on and so forth. The checkpoint region also has a `global_seq` field which tracks the current ongoing segment's `seq` value. Hence, we can just follow an ascending order of sequence value to know the sequence of the segments that were populated
+
+So to track the sequence of segments writes, we keep the first 4 byte entry of the segment summary block as a sequence value `seq` and the next segment allocated from the free-list will have sequence value of `seq + 1`, so on and so forth. The checkpoint region also has a `global_seq` field which tracks the current ongoing segment's `seq` value. Hence, we can just follow an ascending order of sequence value to know the sequence of the segments that were populated.
+
+A tricky thing to notice is that there is a possiblity of the cleaner cleaning the segment referred to by `checkpoint.segment_num` and added back to the free-list. Hence, we can't trust the `checkpoint.segment_num` value blindly. To do this, we will first find all segments which have `seq` value greater than or equal to `checkpoint.global_seq` and sort them in ascending order. Then what we do, is that for the first segment in this list, we compare its `segment_num` with `checkpoint.segment_num`. If they match, then we can be sure that this is the same segment (it wasn't cleaned), and thus we can start roll-forward from `checkpoint.fill_offset` of the first segment till its end, and then continue for each segment in the list from their start to end. If they don't match, we know that this segment has been cleaned up and in this we directly start the roll-forward mechanism from the start of first segment in the list to its end and continue the same for each segment in the list. 
+While looping over the segment list in either of the cases, we stop the roll-forward mechanism when either the list runs out, or if any of the segments trigger the roll-forward end condition (mentioned in next point).
 
 ### 3. Roll-forward end:
 We need to know if the flushed group of blocks was completed properly or not. For this, for each segment summary block (covering 128 blocks), we keep 2 checksums, one is a self checksum to confirm that the segment summary block itself is valid and second is a checksum of all the blocks covered by the segment summary block called the data checksum. If either the self checksum or the data checksum fails for a group, then we stop the roll-forward there itself.
+
+### 4. Replay semantics:
+Now that we have discovered live blocks during the roll-forward mechanism, we need to reconstruct the in-memory checkpoint region in accordance with these blocks. 
+For this, we loop over each block in segments sorted in ascending order of `seq`, and for each block we do the following:
+1. For the discovered block (use the segment summary block to find the type of block), if it is a segment summary block then jump to step 3, else find its current address by walking the imap chain at this point in the replay.
+2. If valid address was found, then decrement the live blocks count of the segment which held the old address.
+3. Increment the live count of the current segment i.e. the segment that this discovered block belongs to.
+4. If the discovered block is an imap block, then update its value in `checkpoint.imap_addr` array.
+
+
+### 5. Persist checkpoint region:
+Choose the checkpoint region which was not chosen as the base for the recovery mechanism as the region which we will write to. 
+Fields of `segment_num`, `fill_offset`, `global_seq` will be taken from the segment where the roll-forward actually ended.
+Lastly, after writing all these 3 fields and the `imap_addr` and `sut` arrays, we write the current timestamp in `timestamp` field.
+
+
+## Garbage Collection
+
+
+### Cleaning Policy
+We use the Cost-Benefit Cleaning policy. 
+
+Cost-Benefit Ratio = (1 - u) * age / (1 + u),
+where `u` is the utilization, i.e. the ratio of the live blocks to the total blocks (512) in a segment and age is the time when the segment was last touched, which is calculated as the `current_timestamp - last_modified_timestamp`. These values are calculated using the SUT.
+
+For this policy we calculate the CBR value for each segment except for the currently active segment and choose the segments to clean by descending order of CBR value.
+
+We start cleaning when the number of clean segments is below a certain threshold and stop cleaning once another threshold is crossed. 
+
+### Mechanism Details
+
+Once we select a segment to clean, for every block in the segment other than the segment summary blocks, we first check liveness via the imap-chain walk; and if it is alive, we pass it on to the write pipeline, as this will append the block, and update the segment summary block and also allocate another new segment incase of the previous one overflows. Once the SUT value of the old segment is zero, then we know that we have cleaned the old segment and we can add it to the free-list. 
+
+Once the clean up is done, we persist it right away onto the disk. Keep in mind that the previously non-active checkpoint region is updated with in-memory checkpoint region.
 
 
