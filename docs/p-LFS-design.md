@@ -110,7 +110,7 @@ Thus we have found the block address of an inode, for a given inode number.
 
 Now that we have seen how to read a file data block, we can design the write path, but before that lets see how a segment is designed in the first place as that info is important in the writing of data in a segment.
 
-A segment has 512 blocks. The first block will always be the segment summary block, which will have, for each block two 4 byte fields. These 2 fields will have different meanings according to their values as they will be used to distinguish between the 4 types of blocks present in the segments - imap blocks, segment summary blocks (a segment can have more than one segment summary block), inode block, file data block.
+A segment has 512 blocks. The first block will always be the segment summary block, which will have, for each block two 4 byte fields. These 2 fields will have different meanings according to their values as they will be used to distinguish between the 5 types of blocks present in the segments - imap blocks, segment summary blocks (a segment can have more than one segment summary block), inode block, indirect block and file data block.
 
    Block type     | 1st 4 bytes      |     2nd 4 bytes
 ---------------------------------------------------------------------------------
@@ -119,6 +119,8 @@ imap block        |     0            |     imap block addrs array index + 1
 seg sum block     |     0            |        0
                   |                  |
 inode block       |   inode num      |        0
+                  |                  |
+indirect block    |   inode num      |       0xFFFFFFFF
                   |                  |
 file data block   |   inode num      |    file data block num 1 indexed
 
@@ -140,13 +142,15 @@ B) Segment summary block - A segment summary block has both bytes as 0, hence it
 
 C) Inode block - 1st 4 bytes are the inode number of the file and the 2nd 4 bytes are 0 in the segment summary block entry. To check livenes, we use the inode number value to find the inode block address via the imap and then compare this found address to the address of current block. If they match, it means it is live, else its dead.
 
-D) File Data block - 1st 4 bytes are the inode number of the file and the 2nd 4 bytes is the position in the file, in the segment summary block entry. To check livenes, we use the inode number value to find the inode block address via the imap and then check if the block address for file block position given in the inode block matches with the current block, if they do then its alive, else its dead.
+D) Indirect block - 1st 4 bytes are the inode number of the file and the 2nd 4 bytes are a sentinal value of 0xFFFFFFFF. This works as we currently have at most 1 indirect block per inode. To check livenes, we use the inode number value to find the inode block address via the imap and through inode block, find the address of the indirect block and then compare this found address to the address of current block. If they match, it means it is live, else its dead.
+
+E) File Data block - 1st 4 bytes are the inode number of the file and the 2nd 4 bytes is the position in the file, in the segment summary block entry. To check livenes, we use the inode number value to find the inode block address via the imap and then check if the block address for file block position given in the inode block matches with the current block, if they do then its alive, else its dead.
 
 
 ## Write Path
 
 The basic algorithm for in-memory write will be like this - 
-1) For each data, inode and imap block about to be written, find its current on-disk address (if any) by walking the imap chain (`imap_addr[idx]` directly for an imap block; `imap_addr[idx]` → imap block entry for an inode block; `imap_addr[idx]` → imap block → inode's `addrs[position]` for a data block), and if a valid old address was found, decrement the live block count (in the SUT) of whichever segment held it. This must happen before any of the pointers below are overwritten. Segment summary blocks are excluded from this step, as they never supersede a prior version.
+1) For each data, inode, indirect and imap block about to be written, find its current on-disk address (if any) by walking the imap chain (`imap_addr[idx]` directly for an imap block; `imap_addr[idx]` → imap block entry for an inode block; `imap_addr[idx]` → imap block → inode's `addrs[position]` for a data block; `imap_addr[idx]` → imap block → inode's indirect-block slot for an indirect block), and if a valid old address was found, decrement the live block count (in the SUT) of whichever segment held it. This must happen before any of the pointers below are overwritten. Segment summary blocks are excluded from this step, as they never supersede a prior version.
 2) Append data to segment
 3) Append inode block to segment
 4) Append imap block to segment
