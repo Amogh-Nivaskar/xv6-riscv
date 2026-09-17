@@ -4,6 +4,7 @@
 
 #define ROOTINO  1   // root i-number
 #define BSIZE 1024  // block size
+#define SSIZE 512  // Segment size in blocks
 
 // Disk layout:
 // [ boot block | super block | log | inode blocks |
@@ -20,6 +21,16 @@ struct superblock {
   uint logstart;     // Block number of first log block
   uint inodestart;   // Block number of first inode block
   uint bmapstart;    // Block number of first free map block
+};
+
+struct lfs_superblock  {
+  uint magic;        // Must be FSMAGIC
+  uint size;         // Size of file system image (blocks)
+  uint checkpoint1start;      // Start of Checkpoint 1 region
+  uint checkpoint2start;      // Start of Checkpoint 2 region
+  uint checkpointsize;        // Size of a Checkpoint region
+  uint ninodes;      // Number of inodes
+  uint segsize;      // Segment size
 };
 
 #define FSMAGIC 0x10203040
