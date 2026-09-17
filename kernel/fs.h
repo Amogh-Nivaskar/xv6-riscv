@@ -117,6 +117,42 @@ struct dinode {
   uint addrs[NDIRECT+1];   // Data block addresses
 };
 
+// In-memory dirty-block caches. A block is buffered here as it's written
+// (or, in mkfs, as the initial image is assembled) and only gets a real
+// on-disk address once its cache is drained into a segment at flush time --
+// blocks can't be updated in place, so repeated writes to the same inode,
+// indirect or data block must find and update the existing node here
+// rather than appending a duplicate. Each node's key mirrors exactly the
+// identifying fields used for its block's segsum_entry tag, so building
+// that tag at flush time is direct. Flush order must walk these bottom-up
+// (data, then indirect, then inode, then imap) since each stage needs the
+// previous stage's blocks to already have their final addresses.
+
+struct data_cache_node {
+  uint inum;                 // which file this data block belongs to
+  uint fbn;                  // 0-indexed file block number
+  char data[BSIZE];
+  struct data_cache_node *next;
+};
+
+struct indirect_cache_node {
+  uint inum;                 // which file this indirect block belongs to
+  uint addrs[NINDIRECT];     // data block addresses for fbn >= NDIRECT
+  struct indirect_cache_node *next;
+};
+
+struct inode_cache_node {
+  uint inum;
+  struct dinode din;
+  struct inode_cache_node *next;
+};
+
+struct imap_cache_node {
+  uint idx;                           // index into checkpoint.imap_addr[]
+  uint addrs[IMAP_ENTRIES_PER_BLK];   // inode block addresses for this range
+  struct imap_cache_node *next;
+};
+
 // Inodes per block.
 #define IPB           (BSIZE / sizeof(struct dinode))
 

@@ -28,6 +28,13 @@ char zeroes[BSIZE];
 uint freeinode = 1;
 uint freeblock;
 
+// Head nodes for block caches.
+// Head node is empty, always start lookup from head.next
+struct data_cache_node dataCacheHead;
+struct indirect_cache_node indirectCacheHead;
+struct inode_cache_node inodeCacheHead;
+struct imap_cache_node imapCacheHead;
+
 
 void balloc(int);
 void wsect(uint, void*);
@@ -429,3 +436,28 @@ die(const char *s)
   perror(s);
   exit(1);
 }
+
+
+struct data_cache_node *
+data_cache_get(uint inum, uint fbn)
+{
+  struct data_cache_node *nxt = dataCacheHead.next;
+
+  while(nxt){
+    if(nxt->inum == inum && nxt->fbn == fbn)
+      return nxt;
+    nxt = nxt->next;
+  }
+
+  // not found: allocate, zero, link in, hand back
+  struct data_cache_node *n = malloc(sizeof(*n));
+  if(n == 0)
+    die("data_cache_get: out of memory");
+  bzero(n, sizeof(*n));
+  n->inum = inum;
+  n->fbn = fbn;
+  n->next = dataCacheHead.next;
+  dataCacheHead.next = n;
+  return n;
+}
+
