@@ -15,16 +15,12 @@
 #define static_assert(a, b) do { switch (0) case 0: case (a): ; } while (0)
 #endif
 
-#define NINODES 64768
-
 // Disk layout:
-// [ boot block | sb block | log | inode blocks | free bit map | data blocks ]
+// [ boot block | sb block | checkpoint region 1 | checkpoint region 2 | segments ]
 
-int nbitmap = FSSIZE/BPB + 1;
-int ninodeblocks = NINODES / IPB + 1;
-int nlog = LOGBLOCKS+1;   // Header followed by LOGBLOCKS data blocks.
-int nmeta;    // Number of meta blocks (boot, sb, nlog, inode, bitmap)
-int nblocks;  // Number of data blocks
+#define NCHECKPOINTBLOCKS 2  // size of a single checkpoint region, in blocks
+int nmeta;    // Number of meta blocks (boot, sb, checkpoint region 1, checkpoint region 2)
+int nblocks;  // Number of blocks available for segments
 
 int fsfd;
 struct lfs_superblock sb;
@@ -41,6 +37,26 @@ void rsect(uint sec, void *buf);
 uint ialloc(ushort type);
 void iappend(uint inum, void *p, int n);
 void die(const char *);
+
+// ---- segment writer ----
+#define GROUP_CAP (NDATA_PER_SEGSUM - 1)  // real (non-summary) blocks per group
+
+uint cur_segment_num;
+uint cur_segment_seq;              // seq assigned to cur_segment_num when it was claimed
+uint cur_fill_offset;             // next free relative block index in cur_segment_num
+uint global_seq;                   // next seq to hand out when a segment is claimed
+struct checkpoint cp;              // in-memory checkpoint state; written to disk once fully built
+
+struct segsum_block cur_summary;
+char group_data[GROUP_CAP][BSIZE];
+int group_n;                      // blocks buffered in the current, unflushed group
+
+uint checksum(void *data, int nbytes);
+uint segment_start_block(uint segnum);
+uint next_free_segment(void);
+int group_capacity(void);
+void seg_flush_group(void);
+uint seg_write_block(uint tag1, uint tag2, void *data);
 
 // convert to riscv byte order
 ushort
@@ -90,20 +106,31 @@ main(int argc, char *argv[])
     die(argv[1]);
 
   // 1 fs block = 1 disk sector
-  nmeta = 2 + nlog + ninodeblocks + nbitmap;
+  // [ boot(1) | super(1) | checkpoint region 1(NCHECKPOINTBLOCKS) | checkpoint region 2(NCHECKPOINTBLOCKS) ]
+  nmeta = 2 + 2*NCHECKPOINTBLOCKS;
   nblocks = FSSIZE - nmeta;
+  assert(nblocks / SSIZE == SEG_NUM);
 
   sb.magic = FSMAGIC;
   sb.size = xint(FSSIZE);
   sb.checkpoint1start = xint(2);
-  sb.checkpoint2start = xint(4);
-  sb.checkpointsize = xint(2);
+  sb.checkpoint2start = xint(2 + NCHECKPOINTBLOCKS);
+  sb.checkpointsize = xint(NCHECKPOINTBLOCKS);
   sb.ninodes = xint(NINODES);
   sb.segsize = xint(SSIZE);
 
 
-  printf("nmeta %d (boot, super, log blocks %u, inode blocks %u, bitmap blocks %u) blocks %d total %d\n",
-         nmeta, nlog, ninodeblocks, nbitmap, nblocks, FSSIZE);
+  printf("nmeta %d (boot, super, checkpoint region blocks %u x2) segment blocks %d total %d\n",
+         nmeta, NCHECKPOINTBLOCKS, nblocks, FSSIZE);
+
+  bzero(&cp, sizeof(cp));
+  memset(cp.seg_freemap, 0xff, sizeof(cp.seg_freemap));  // all segments start free
+
+  global_seq = 0;
+  cur_segment_num = next_free_segment();
+  cur_segment_seq = global_seq++;
+  cur_fill_offset = 0;
+  group_n = 0;
 
   freeblock = nmeta;     // the first free block that we can allocate
 
@@ -171,6 +198,8 @@ main(int argc, char *argv[])
 
   balloc(freeblock);
 
+  seg_flush_group();  // flush whatever's left in the in-progress group
+
   exit(0);
 }
 
@@ -217,6 +246,105 @@ rsect(uint sec, void *buf)
     die("lseek");
   if(read(fsfd, buf, BSIZE) != BSIZE)
     die("read");
+}
+
+// simple rotate-xor checksum; not cryptographic, only meant to catch a
+// torn/incomplete write during crash recovery, not adversarial corruption.
+uint
+checksum(void *data, int nbytes)
+{
+  uint *w = (uint*) data;
+  uint sum = 0;
+  int nwords = nbytes / sizeof(uint);
+  for(int i = 0; i < nwords; i++)
+    sum = (sum << 1 | sum >> 31) ^ w[i];
+  return sum;
+}
+
+uint
+segment_start_block(uint segnum)
+{
+  return nmeta + segnum * SSIZE;
+}
+
+uint
+next_free_segment(void)
+{
+  for(uint s = 0; s < SEG_NUM; s++){
+    if(cp.seg_freemap[s/8] & (1 << (s%8))){
+      cp.seg_freemap[s/8] &= ~(1 << (s%8));  // claim it: no longer free
+      return s;
+    }
+  }
+  die("next_free_segment: no free segments");
+  return 0;  // unreachable
+}
+
+// how many more real (non-summary) blocks the in-progress group could
+// take before it would run past the end of the current segment.
+int
+group_capacity(void)
+{
+  int remaining = BLOCKS_PER_SEG - cur_fill_offset;  // includes room for the group's own summary block
+  if(remaining <= 1)
+    return 0;
+  int cap = remaining - 1;
+  if(cap > GROUP_CAP)
+    cap = GROUP_CAP;
+  return cap;
+}
+
+// write the in-progress group's summary block followed by its data
+// blocks to disk, in one contiguous run, and reset group state.
+void
+seg_flush_group(void)
+{
+  if(group_n == 0)
+    return;
+
+  for(int i = group_n; i < NDATA_PER_SEGSUM - 1; i++){
+    cur_summary.entries[i].tag1 = xint(0);
+    cur_summary.entries[i].tag2 = xint(0);
+  }
+
+  cur_summary.data_checksum = xint(checksum(group_data, group_n * BSIZE));
+  cur_summary.self_checksum = xint(checksum(&cur_summary, sizeof(cur_summary) - sizeof(uint)));
+
+  uint summary_addr = segment_start_block(cur_segment_num) + cur_fill_offset;
+  wsect(summary_addr, &cur_summary);
+  for(int i = 0; i < group_n; i++)
+    wsect(summary_addr + 1 + i, group_data[i]);
+
+  cur_fill_offset += 1 + group_n;
+  group_n = 0;
+}
+
+// append one logical block (imap/inode/data) to the segment being built,
+// flushing the current group and/or rolling to a new segment as needed.
+// returns the physical block address the caller should record (e.g. in
+// an inode's addrs[] or in checkpoint.imap_addr[]) for this block.
+uint
+seg_write_block(uint tag1, uint tag2, void *data)
+{
+  if(group_n > 0 && group_n == group_capacity())
+    seg_flush_group();
+
+  if(group_capacity() == 0){
+    cur_segment_num = next_free_segment();
+    cur_segment_seq = global_seq++;
+    cur_fill_offset = 0;
+  }
+
+  if(group_n == 0)
+    cur_summary.seq = xint(cur_segment_seq);
+
+  cur_summary.entries[group_n].tag1 = xint(tag1);
+  cur_summary.entries[group_n].tag2 = xint(tag2);
+  memmove(group_data[group_n], data, BSIZE);
+
+  uint addr = segment_start_block(cur_segment_num) + cur_fill_offset + 1 + group_n;
+  group_n++;
+  return addr;
 }
 
 uint

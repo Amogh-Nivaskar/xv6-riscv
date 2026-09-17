@@ -35,6 +35,74 @@ struct lfs_superblock  {
 
 #define FSMAGIC 0x10203040
 
+#define NINODES 64768
+
+// One entry per physical block in a segment, held in a segsum_block.
+// (0, 0)              -> this block is itself a segment summary block
+// (0, idx+1)          -> imap block, idx into checkpoint.imap_addr[]
+// (inum, 0)           -> inode block for inode inum
+// (inum, fbn+1)       -> file data block, fbn is the 0-indexed file block number
+struct segsum_entry {
+  uint tag1;
+  uint tag2;
+};
+
+// A segment summary block describes NDATA_PER_SEGSUM consecutive physical
+// blocks: its own logical position (0) plus the NDATA_PER_SEGSUM-1 real
+// (imap/inode/data) blocks that immediately follow it on disk. Logical
+// position 0 never needs a real tag pair -- it's always "this position is
+// a segment summary block" by structural convention, never read from its
+// bytes -- so those bytes are reused for this block's own checksums and
+// seq number instead of being wasted on a literal (0, 0).
+// seq is assigned once, from a monotonically increasing global counter,
+// the moment a segment is claimed from the free list, and is stamped
+// identically into every group's summary block written into that segment
+// for its whole lifetime. Crash recovery reconstructs write order by
+// scanning all segments and comparing seq values, rather than trusting a
+// forward pointer or a possibly-stale persisted free list.
+// self_checksum is kept physically LAST in the struct (rather than in
+// logical position 0, which is physically first) so that, under the
+// assumed sequential/in-order write behavior, it still covers every other
+// byte of this block -- including seq and data_checksum -- and can detect
+// a torn write of the block itself, which a checksum placed early in the
+// block could not.
+#define NDATA_PER_SEGSUM 127                     // logical positions covered (0 = self)
+#define BLOCKS_PER_SEG SSIZE
+
+struct segsum_block {
+  struct segsum_entry entries[NDATA_PER_SEGSUM - 1];  // logical positions 1..126
+  uint data_checksum;   // checksum over the blocks this group describes
+  uint seq;             // this segment's write-order sequence number
+  uint self_checksum;   // checksum over entries[]+data_checksum+seq, must be last
+};
+
+#define IMAP_ENTRIES_PER_BLK (BSIZE / sizeof(uint))          // 256
+#define IMAP_BLK_NUM ((NINODES + IMAP_ENTRIES_PER_BLK - 1) / IMAP_ENTRIES_PER_BLK)  // 253
+#define SEG_NUM 100
+
+struct sut_entry {
+  uint live_count;
+  uint last_mod_time;
+};
+
+// bit i set means segment i is free (available to be handed out by the
+// allocator). Separate from sut[]: sut[] records live-block accounting
+// used to decide which segments are worth cleaning, while seg_freemap is
+// the pool the allocator actually draws from -- a segment only rejoins it
+// once the cleaner (or mkfs, at image-build time) has fully vacated it.
+#define SEG_FREEMAP_BYTES ((SEG_NUM + 7) / 8)  // 13 bytes for 100 segments
+
+// checkpoint.timestamp must remain the last field: recovery trusts a
+// checkpoint region only if its timestamp shows the write completed.
+struct checkpoint {
+  uint segment_num;
+  uint fill_offset;
+  uint imap_addr[IMAP_BLK_NUM];
+  struct sut_entry sut[SEG_NUM];
+  uchar seg_freemap[SEG_FREEMAP_BYTES];
+  uint timestamp;
+};
+
 #define NDIRECT 12
 #define NINDIRECT (BSIZE / sizeof(uint))
 #define MAXFILE (NDIRECT + NINDIRECT)
