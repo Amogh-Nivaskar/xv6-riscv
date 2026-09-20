@@ -18,7 +18,6 @@
 // Disk layout:
 // [ boot block | sb block | checkpoint region 1 | checkpoint region 2 | segments ]
 
-#define NCHECKPOINTBLOCKS 2  // size of a single checkpoint region, in blocks
 int nmeta;    // Number of meta blocks (boot, sb, checkpoint region 1, checkpoint region 2)
 int nblocks;  // Number of blocks available for segments
 
@@ -26,7 +25,6 @@ int fsfd;
 struct lfs_superblock sb;
 char zeroes[BSIZE];
 uint freeinode = 1;
-uint freeblock;
 
 // Head nodes for block caches.
 // Head node is empty, always start lookup from head.next
@@ -36,27 +34,25 @@ struct inode_cache_node inodeCacheHead;
 struct imap_cache_node imapCacheHead;
 
 
-void balloc(int);
+// Forward declarations of functions
 void wsect(uint, void*);
-void winode(uint, struct dinode*);
-void rinode(uint inum, struct dinode *ip);
 void rsect(uint sec, void *buf);
 uint ialloc(ushort type);
 void iappend(uint inum, void *p, int n);
 void die(const char *);
 
-// ---- segment writer ----
-#define GROUP_CAP (NDATA_PER_SEGSUM - 1)  // real (non-summary) blocks per group
-
-uint cur_segment_num;
-uint cur_segment_seq;              // seq assigned to cur_segment_num when it was claimed
-uint cur_fill_offset;             // next free relative block index in cur_segment_num
-uint global_seq;                   // next seq to hand out when a segment is claimed
-struct checkpoint cp;              // in-memory checkpoint state; written to disk once fully built
-
-struct segsum_block cur_summary;
-char group_data[GROUP_CAP][BSIZE];
-int group_n;                      // blocks buffered in the current, unflushed group
+struct data_cache_node *data_cache_lookup(uint inum, uint fbn);
+struct data_cache_node *data_cache_get_or_create(uint inum, uint fbn);
+struct data_cache_node *data_cache_pop(uint inum, uint fbn);
+struct indirect_cache_node *indirect_cache_lookup(uint inum);
+struct indirect_cache_node *indirect_cache_get_or_create(uint inum);
+struct indirect_cache_node *indirect_cache_pop(uint inum);
+struct inode_cache_node *inode_cache_lookup(uint inum);
+struct inode_cache_node *inode_cache_get_or_create(uint inum);
+struct inode_cache_node *inode_cache_pop(uint inum);
+struct imap_cache_node *imap_cache_lookup(uint idx);
+struct imap_cache_node *imap_cache_get_or_create(uint idx);
+struct imap_cache_node *imap_cache_pop(uint idx);
 
 uint checksum(void *data, int nbytes);
 uint segment_start_block(uint segnum);
@@ -64,6 +60,16 @@ uint next_free_segment(void);
 int group_capacity(void);
 void seg_flush_group(void);
 uint seg_write_block(uint tag1, uint tag2, void *data);
+void checkpoint_flush(uint checkpointstart, struct checkpoint *cp);
+
+
+
+struct checkpoint cp;              // in-memory checkpoint state; written to disk once fully built
+struct segsum_block cur_summary;
+char group_data[GROUP_CAP][BSIZE];
+int group_n;                      // blocks buffered in the current, unflushed group
+int cp_counter;
+
 
 // convert to riscv byte order
 ushort
@@ -95,7 +101,6 @@ main(int argc, char *argv[])
   uint rootino, inum, off;
   struct dirent de;
   char buf[BSIZE];
-  struct dinode din;
 
 
   static_assert(sizeof(int) == 4, "Integers must be 4 bytes!");
@@ -133,13 +138,11 @@ main(int argc, char *argv[])
   bzero(&cp, sizeof(cp));
   memset(cp.seg_freemap, 0xff, sizeof(cp.seg_freemap));  // all segments start free
 
-  global_seq = 0;
-  cur_segment_num = next_free_segment();
-  cur_segment_seq = global_seq++;
-  cur_fill_offset = 0;
+  cp.global_seq = 0;
+  cp.segment_num = next_free_segment();
+  cp.global_seq++;
+  cp.fill_offset = 0;
   group_n = 0;
-
-  freeblock = nmeta;     // the first free block that we can allocate
 
   for(i = 0; i < FSSIZE; i++)
     wsect(i, zeroes);
@@ -193,19 +196,73 @@ main(int argc, char *argv[])
     while((cc = read(fd, buf, sizeof(buf))) > 0)
       iappend(inum, buf, cc);
 
+    struct inode_cache_node *inode_node = inode_cache_pop(inum);
+    struct indirect_cache_node *indirect_node = indirect_cache_pop(inum);
+    struct imap_cache_node *imap_node = imap_cache_lookup(IMAP_BLK_IDX(inum));
+
+    for (int fbn = 0; fbn < MAXFILE; fbn++){
+      struct data_cache_node* data_node = data_cache_pop(inum, fbn);
+
+      if (data_node == NULL){
+        break;
+      }
+
+      uint data_diskaddr = seg_write_block(inum, fbn+1, data_node->data);
+      free(data_node);
+
+      if (fbn < NDIRECT){
+        inode_node->din.addrs[fbn] = xint(data_diskaddr);
+      }else{
+        indirect_node->addrs[fbn - NDIRECT] = xint(data_diskaddr);
+      }
+    }
+
+    if (indirect_node != NULL){
+      uint indirect_diskaddr = seg_write_block(inum, 0xFFFFFFFF, indirect_node->addrs);
+      free(indirect_node);
+
+      inode_node->din.addrs[NDIRECT] = xint(indirect_diskaddr); 
+    }
+
+    uint inode_diskaddr = seg_write_block(inum, 0, &inode_node->din);
+    free(inode_node);
+
+    imap_node->addrs[IMAP_OFFSET(inum)] = xint(inode_diskaddr);
+
     close(fd);
   }
 
   // fix size of root inode dir
-  rinode(rootino, &din);
-  off = xint(din.size);
+  struct inode_cache_node *root_inode_node = inode_cache_pop(rootino);
+  off = xint(root_inode_node->din.size);
   off = ((off/BSIZE) + 1) * BSIZE;
-  din.size = xint(off);
-  winode(rootino, &din);
+  root_inode_node->din.size = xint(off);
 
-  balloc(freeblock);
+  
+  struct imap_cache_node *imap_node = imap_cache_lookup(IMAP_BLK_IDX(rootino));
+  uint root_inode_diskaddr = seg_write_block(rootino, 0, &root_inode_node->din);
+  imap_node->addrs[IMAP_OFFSET(rootino)] = xint(root_inode_diskaddr);
+  free(root_inode_node);
+
+  for (int idx = 0; idx < IMAP_BLK_NUM; idx++){
+    struct imap_cache_node *imap_node = imap_cache_pop(idx);
+
+    if (imap_node == NULL){
+      break;
+    }
+
+    uint imap_diskaddr = seg_write_block(0, idx+1, imap_node->addrs);
+    free(imap_node);
+
+    cp.imap_addr[idx] = xint(imap_diskaddr);
+  }
 
   seg_flush_group();  // flush whatever's left in the in-progress group
+
+  cp.timestamp = xint(++cp_counter);
+
+  checkpoint_flush(xint(sb.checkpoint1start), &cp);
+  checkpoint_flush(xint(sb.checkpoint2start), &cp);
 
   exit(0);
 }
@@ -217,33 +274,6 @@ wsect(uint sec, void *buf)
     die("lseek");
   if(write(fsfd, buf, BSIZE) != BSIZE)
     die("write");
-}
-
-void
-winode(uint inum, struct dinode *ip)
-{
-  char buf[BSIZE];
-  uint bn;
-  struct dinode *dip;
-
-  bn = IBLOCK(inum, sb);
-  rsect(bn, buf);
-  dip = ((struct dinode*)buf) + (inum % IPB);
-  *dip = *ip;
-  wsect(bn, buf);
-}
-
-void
-rinode(uint inum, struct dinode *ip)
-{
-  char buf[BSIZE];
-  uint bn;
-  struct dinode *dip;
-
-  bn = IBLOCK(inum, sb);
-  rsect(bn, buf);
-  dip = ((struct dinode*)buf) + (inum % IPB);
-  *ip = *dip;
 }
 
 void
@@ -292,7 +322,7 @@ next_free_segment(void)
 int
 group_capacity(void)
 {
-  int remaining = BLOCKS_PER_SEG - cur_fill_offset;  // includes room for the group's own summary block
+  int remaining = BLOCKS_PER_SEG - cp.fill_offset;  // includes room for the group's own summary block
   if(remaining <= 1)
     return 0;
   int cap = remaining - 1;
@@ -317,12 +347,14 @@ seg_flush_group(void)
   cur_summary.data_checksum = xint(checksum(group_data, group_n * BSIZE));
   cur_summary.self_checksum = xint(checksum(&cur_summary, sizeof(cur_summary) - sizeof(uint)));
 
-  uint summary_addr = segment_start_block(cur_segment_num) + cur_fill_offset;
+  uint summary_addr = segment_start_block(cp.segment_num) + cp.fill_offset;
   wsect(summary_addr, &cur_summary);
   for(int i = 0; i < group_n; i++)
     wsect(summary_addr + 1 + i, group_data[i]);
 
-  cur_fill_offset += 1 + group_n;
+  cp.fill_offset += 1 + group_n;
+  cp.sut[cp.segment_num].live_count++;
+  cp.sut[cp.segment_num].last_mod_time = cp.global_seq; 
   group_n = 0;
 }
 
@@ -337,52 +369,52 @@ seg_write_block(uint tag1, uint tag2, void *data)
     seg_flush_group();
 
   if(group_capacity() == 0){
-    cur_segment_num = next_free_segment();
-    cur_segment_seq = global_seq++;
-    cur_fill_offset = 0;
+    cp.segment_num = next_free_segment();
+    cp.global_seq++;
+    cp.fill_offset = 0;
   }
 
   if(group_n == 0)
-    cur_summary.seq = xint(cur_segment_seq);
+    cur_summary.seq = xint(cp.global_seq);
 
   cur_summary.entries[group_n].tag1 = xint(tag1);
   cur_summary.entries[group_n].tag2 = xint(tag2);
   memmove(group_data[group_n], data, BSIZE);
 
-  uint addr = segment_start_block(cur_segment_num) + cur_fill_offset + 1 + group_n;
+  uint addr = segment_start_block(cp.segment_num) + cp.fill_offset + 1 + group_n;
   group_n++;
+  cp.sut[cp.segment_num].live_count++;
+  cp.sut[cp.segment_num].last_mod_time = cp.global_seq; 
   return addr;
+}
+
+void checkpoint_flush(uint checkpointstart, struct checkpoint *cp){
+  char *p = (char*)cp;
+
+  for (int b=0; b < NCHECKPOINTBLOCKS; b++){
+    wsect(checkpointstart + b, p + (b * BSIZE));
+  }
 }
 
 uint
 ialloc(ushort type)
 {
   uint inum = freeinode++;
-  struct dinode din;
+  assert(inum <= NINODES);
 
-  bzero(&din, sizeof(din));
-  din.type = xshort(type);
-  din.nlink = xshort(1);
-  din.size = xint(0);
-  winode(inum, &din);
+  struct inode_cache_node *inode_node = inode_cache_get_or_create(inum);
+
+  inode_node->din.type = xshort(type);
+  inode_node->din.nlink = xshort(1);
+  inode_node->din.size = xint(0);
+
+  struct imap_cache_node *imap_node = imap_cache_get_or_create(IMAP_BLK_IDX(inum));
+  imap_node->addrs[IMAP_OFFSET(inum)] = xint(0xFFFFFFFF);
+  
   return inum;
 }
 
-void
-balloc(int used)
-{
-  uchar buf[BSIZE];
-  int i;
 
-  printf("balloc: first %d blocks have been allocated\n", used);
-  assert(used < BPB);
-  bzero(buf, BSIZE);
-  for(i = 0; i < used; i++){
-    buf[i/8] = buf[i/8] | (0x1 << (i%8));
-  }
-  printf("balloc: write bitmap block at sector %d\n", sb.bmapstart);
-  wsect(sb.bmapstart, buf);
-}
 
 #define min(a, b) ((a) < (b) ? (a) : (b))
 
@@ -391,43 +423,36 @@ iappend(uint inum, void *xp, int n)
 {
   char *p = (char*)xp;
   uint fbn, off, n1;
-  struct dinode din;
-  char buf[BSIZE];
-  uint indirect[NINDIRECT];
-  uint x;
 
-  rinode(inum, &din);
-  off = xint(din.size);
+  struct inode_cache_node *inode_node = inode_cache_get_or_create(inum);
+  off = xint(inode_node->din.size);
   // printf("append inum %d at off %d sz %d\n", inum, off, n);
   while(n > 0){
     fbn = off / BSIZE;
     assert(fbn < MAXFILE);
     if(fbn < NDIRECT){
-      if(xint(din.addrs[fbn]) == 0){
-        din.addrs[fbn] = xint(freeblock++);
+      if(xint(inode_node->din.addrs[fbn]) == 0){
+        inode_node->din.addrs[fbn] = xint(0xFFFFFFFF);
       }
-      x = xint(din.addrs[fbn]);
     } else {
-      if(xint(din.addrs[NDIRECT]) == 0){
-        din.addrs[NDIRECT] = xint(freeblock++);
+      if(xint(inode_node->din.addrs[NDIRECT]) == 0){
+        inode_node->din.addrs[NDIRECT] = xint(0xFFFFFFFF);
       }
-      rsect(xint(din.addrs[NDIRECT]), (char*)indirect);
-      if(indirect[fbn - NDIRECT] == 0){
-        indirect[fbn - NDIRECT] = xint(freeblock++);
-        wsect(xint(din.addrs[NDIRECT]), (char*)indirect);
-      }
-      x = xint(indirect[fbn-NDIRECT]);
+
+      struct indirect_cache_node *indirect_node = indirect_cache_get_or_create(inum);
+      indirect_node->addrs[fbn - NDIRECT] = xint(0xFFFFFFFF);
     }
+
     n1 = min(n, (fbn + 1) * BSIZE - off);
-    rsect(x, buf);
-    bcopy(p, buf + off - (fbn * BSIZE), n1);
-    wsect(x, buf);
+
+    struct data_cache_node *data_node = data_cache_get_or_create(inum, fbn);
+    memmove(data_node->data + off - (fbn * BSIZE), p, n1);
+
     n -= n1;
     off += n1;
     p += n1;
   }
-  din.size = xint(off);
-  winode(inum, &din);
+  inode_node->din.size = xint(off);
 }
 
 void
@@ -438,8 +463,7 @@ die(const char *s)
 }
 
 
-struct data_cache_node *
-data_cache_get(uint inum, uint fbn)
+struct data_cache_node* data_cache_lookup(uint inum, uint fbn)
 {
   struct data_cache_node *nxt = dataCacheHead.next;
 
@@ -448,11 +472,19 @@ data_cache_get(uint inum, uint fbn)
       return nxt;
     nxt = nxt->next;
   }
+  return 0;
+}
+
+struct data_cache_node* data_cache_get_or_create(uint inum, uint fbn)
+{
+  struct data_cache_node *n = data_cache_lookup(inum, fbn);
+  if(n)
+    return n;
 
   // not found: allocate, zero, link in, hand back
-  struct data_cache_node *n = malloc(sizeof(*n));
+  n = malloc(sizeof(*n));
   if(n == 0)
-    die("data_cache_get: out of memory");
+    die("data_cache_get_or_create: out of memory");
   bzero(n, sizeof(*n));
   n->inum = inum;
   n->fbn = fbn;
@@ -460,4 +492,163 @@ data_cache_get(uint inum, uint fbn)
   dataCacheHead.next = n;
   return n;
 }
+
+// finds, unlinks and returns the node (caller now owns it -- free it, or
+// let it leak into seg_write_block's copy and free it right after), or
+// returns 0 if no matching node exists. plain deletion is just
+// free(data_cache_pop(inum, fbn)).
+struct data_cache_node* data_cache_pop(uint inum, uint fbn)
+{
+  struct data_cache_node *prev = &dataCacheHead;
+  struct data_cache_node *cur = dataCacheHead.next;
+
+  while(cur){
+    if(cur->inum == inum && cur->fbn == fbn){
+      prev->next = cur->next;
+      return cur;
+    }
+    prev = cur;
+    cur = cur->next;
+  }
+  return 0;
+}
+
+
+struct indirect_cache_node* indirect_cache_lookup(uint inum){
+  struct indirect_cache_node *nxt = indirectCacheHead.next;
+
+  while (nxt){
+    if (nxt->inum == inum){
+      return nxt;
+    }
+    nxt = nxt->next;
+  }
+  return 0;
+}
+
+struct indirect_cache_node* indirect_cache_get_or_create(uint inum){
+  struct indirect_cache_node *n = indirect_cache_lookup(inum);
+  if (n)
+    return n;
+
+  n = malloc(sizeof(*n));
+  if (n == 0){
+    die("indirect_cache_get_or_create: out of memory");
+  }
+
+  bzero(n, sizeof(*n));
+  n->inum = inum;
+  n->next = indirectCacheHead.next;
+  indirectCacheHead.next = n;
+
+  return n;
+}
+
+struct indirect_cache_node* indirect_cache_pop(uint inum){
+  struct indirect_cache_node *prev = &indirectCacheHead;
+  struct indirect_cache_node *cur = indirectCacheHead.next;
+
+  while(cur){
+    if(cur->inum == inum){
+      prev->next = cur->next;
+      return cur;
+    }
+    prev = cur;
+    cur = cur->next;
+  }
+  return 0;
+}
+
+struct inode_cache_node* inode_cache_lookup(uint inum){
+  struct inode_cache_node *nxt = inodeCacheHead.next;
+
+  while (nxt){
+    if (nxt->inum == inum){
+      return nxt;
+    }
+    nxt = nxt->next;
+  }
+  return 0;
+}
+
+struct inode_cache_node* inode_cache_get_or_create(uint inum){
+  struct inode_cache_node *n = inode_cache_lookup(inum);
+  if (n)
+    return n;
+
+  n = malloc(sizeof(*n));
+  if (n == 0){
+    die("inode_cache_get_or_create: out of memory");
+  }
+
+  bzero(n, sizeof(*n));
+  n->inum = inum;
+  n->next = inodeCacheHead.next;
+  inodeCacheHead.next = n;
+
+  return n;
+}
+
+struct inode_cache_node* inode_cache_pop(uint inum){
+  struct inode_cache_node *prev = &inodeCacheHead;
+  struct inode_cache_node *cur = inodeCacheHead.next;
+
+  while(cur){
+    if(cur->inum == inum){
+      prev->next = cur->next;
+      return cur;
+    }
+    prev = cur;
+    cur = cur->next;
+  }
+  return 0;
+}
+
+struct imap_cache_node* imap_cache_lookup(uint idx){
+  struct imap_cache_node *nxt = imapCacheHead.next;
+
+  while (nxt){
+    if (nxt->idx == idx){
+      return nxt;
+    }
+    nxt = nxt->next;
+  }
+  return 0;
+}
+
+struct imap_cache_node* imap_cache_get_or_create(uint idx){
+  struct imap_cache_node *n = imap_cache_lookup(idx);
+  if (n)
+    return n;
+
+  n = malloc(sizeof(*n));
+  if (n == 0){
+    die("imap_cache_get_or_create: out of memory");
+  }
+
+  bzero(n, sizeof(*n));
+  n->idx = idx;
+  n->next = imapCacheHead.next;
+  imapCacheHead.next = n;
+
+  return n;
+}
+
+struct imap_cache_node* imap_cache_pop(uint idx){
+  struct imap_cache_node *prev = &imapCacheHead;
+  struct imap_cache_node *cur = imapCacheHead.next;
+
+  while(cur){
+    if(cur->idx == idx){
+      prev->next = cur->next;
+      return cur;
+    }
+    prev = cur;
+    cur = cur->next;
+  }
+  return 0;
+}
+
+
+
 

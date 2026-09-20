@@ -85,6 +85,8 @@ struct sut_entry {
   uint last_mod_time;
 };
 
+#define GROUP_CAP (NDATA_PER_SEGSUM - 1)  // real (non-summary) blocks per group
+
 // bit i set means segment i is free (available to be handed out by the
 // allocator). Separate from sut[]: sut[] records live-block accounting
 // used to decide which segments are worth cleaning, while seg_freemap is
@@ -100,9 +102,16 @@ struct checkpoint {
   uint imap_addr[IMAP_BLK_NUM];
   struct sut_entry sut[SEG_NUM];
   uchar seg_freemap[SEG_FREEMAP_BYTES];
+  uint global_seq;
   uint timestamp;
 };
 
+#define NCHECKPOINTBLOCKS 2  // size of a single checkpoint region, in blocks
+
+// kept small for now so testing exercises the indirect-block path; bump to
+// 252 later (makes addrs[] fill the rest of the block exactly: 12 fixed
+// bytes + 253*4 = 1024 = BSIZE, so sizeof(struct dinode) == BSIZE and
+// IPB == 1) once indirect access is confirmed working.
 #define NDIRECT 12
 #define NINDIRECT (BSIZE / sizeof(uint))
 #define MAXFILE (NDIRECT + NINDIRECT)
@@ -167,6 +176,12 @@ struct imap_cache_node {
 
 // Directory is a file containing a sequence of dirent structures.
 #define DIRSIZ 14
+
+// Which imap block (checkpoint.imap_addr[] index / imap_cache key) covers this inode.
+#define IMAP_BLK_IDX(inum) (((inum) - 1) / IMAP_ENTRIES_PER_BLK)
+
+// Offset within that imap block's addrs[] array for this inode.
+#define IMAP_OFFSET(inum) (((inum) - 1) % IMAP_ENTRIES_PER_BLK)
 
 // The name field may have DIRSIZ characters and not end in a NUL
 // character.
