@@ -58,6 +58,8 @@ struct virtq_desc {
 };
 #define VRING_DESC_F_NEXT  1 // chained with another descriptor
 #define VRING_DESC_F_WRITE 2 // device writes (vs read)
+#define VRING_DESC_F_INDIRECT 4 // buffer holds a table of further descriptors
+
 
 // the (entire) avail ring, from the spec.
 struct virtq_avail {

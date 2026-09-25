@@ -50,6 +50,8 @@ static struct disk {
     char status;
   } info[NUM];
 
+  struct virtq_desc indirect_table[514];
+
   // disk command headers.
   // one-for-one with descriptors, for convenience.
   struct virtio_blk_req ops[NUM];
@@ -91,7 +93,7 @@ virtio_disk_init(void)
   features &= ~(1 << VIRTIO_BLK_F_MQ);
   features &= ~(1 << VIRTIO_F_ANY_LAYOUT);
   features &= ~(1 << VIRTIO_RING_F_EVENT_IDX);
-  features &= ~(1 << VIRTIO_RING_F_INDIRECT_DESC);
+  // features &= ~(1 << VIRTIO_RING_F_INDIRECT_DESC);
   *R(VIRTIO_MMIO_DRIVER_FEATURES) = features;
 
   // tell device that feature negotiation is complete.
@@ -290,6 +292,43 @@ virtio_disk_rw(struct buf *b, int write)
 
   release(&disk.vdisk_lock);
 }
+
+void virtio_disk_seg_w(uint64 addrs[512], int blocksCount, uint64 sectorAddr){
+
+  int descIdx = alloc_desc(); 
+
+  disk.desc[descIdx].flags = VRING_DESC_F_INDIRECT;
+  disk.desc[descIdx].addr = disk.indirect_table;
+  disk.desc[descIdx].len = (blocksCount * sizeof(struct virtq_desc));
+
+  struct virtio_blk_req *buf0 = &disk.ops[descIdx];
+  
+  buf0->type = VIRTIO_BLK_T_OUT;
+  buf0->reserved = 0;
+  buf0->sector = sectorAddr;
+
+  disk.indirect_table[0].addr = buf0;
+  disk.indirect_table[0].len = sizeof(struct virtio_blk_req);
+  disk.indirect_table[0].flags = VRING_DESC_F_NEXT;
+  disk.indirect_table[0].next = &disk.indirect_table[1];
+
+  for (int i=1; i <= blocksCount; i++){
+    disk.indirect_table[i].addr = addrs[i-1];
+    disk.indirect_table[i].len = BSIZE;
+    disk.indirect_table[i].flags = VRING_DESC_F_NEXT;
+    disk.indirect_table[i-1].next = &disk.indirect_table[i];
+  }
+  
+  disk.info[descIdx].status = 0xff;
+
+  disk.indirect_table[blocksCount+1].addr = &disk.info[descIdx];
+  disk.indirect_table[blocksCount+1].len = 1;
+  disk.indirect_table[blocksCount+1].flags = VRING_DESC_F_WRITE;
+  disk.indirect_table[blocksCount].next = &disk.indirect_table[blocksCount+1];
+  disk.indirect_table[blocksCount+1].next = 0;
+
+}
+
 
 void
 virtio_disk_intr()
