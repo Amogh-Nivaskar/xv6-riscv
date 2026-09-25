@@ -47,6 +47,7 @@ static struct disk {
   // indexed by first descriptor index of chain.
   struct {
     struct buf *b;
+    struct segbuf *sb;
     char status;
   } info[NUM];
 
@@ -293,22 +294,22 @@ virtio_disk_rw(struct buf *b, int write)
   release(&disk.vdisk_lock);
 }
 
-void virtio_disk_seg_w(uint64 addrs[512], int blocksCount, uint64 sectorAddr){
+void virtio_disk_seg_w(struct segbuf *sb, int blocksCount, uint64 sectorAddr){
 
   acquire(&disk.vdisk_lock);
 
   int descIdx = -1; 
 
   while (1){
-    if (descIdx = alloc_desc() >= 0){
+    if ((descIdx = alloc_desc()) >= 0){
       break;
     }
     sleep(&disk.free[0], &disk.vdisk_lock);
   }
 
   disk.desc[descIdx].flags = VRING_DESC_F_INDIRECT;
-  disk.desc[descIdx].addr = disk.indirect_table;
-  disk.desc[descIdx].len = (blocksCount * sizeof(struct virtq_desc) + 2); // desc for blocks and header and status
+  disk.desc[descIdx].addr = (uint64) disk.indirect_table;
+  disk.desc[descIdx].len = (blocksCount + 2) * sizeof(struct virtq_desc) ; // desc for blocks and header and status
 
   struct virtio_blk_req *buf0 = &disk.ops[descIdx];
   
@@ -316,13 +317,13 @@ void virtio_disk_seg_w(uint64 addrs[512], int blocksCount, uint64 sectorAddr){
   buf0->reserved = 0;
   buf0->sector = sectorAddr;
 
-  disk.indirect_table[0].addr = buf0;
+  disk.indirect_table[0].addr = (uint64) buf0;
   disk.indirect_table[0].len = sizeof(struct virtio_blk_req);
   disk.indirect_table[0].flags = VRING_DESC_F_NEXT;
   disk.indirect_table[0].next = 1;
 
   for (int i=1; i <= blocksCount; i++){
-    disk.indirect_table[i].addr = addrs[i-1];
+    disk.indirect_table[i].addr = sb->addrs[i-1];
     disk.indirect_table[i].len = BSIZE;
     disk.indirect_table[i].flags = VRING_DESC_F_NEXT;
     disk.indirect_table[i-1].next = i;
@@ -330,11 +331,34 @@ void virtio_disk_seg_w(uint64 addrs[512], int blocksCount, uint64 sectorAddr){
   
   disk.info[descIdx].status = 0xff;
 
-  disk.indirect_table[blocksCount+1].addr = &disk.info[descIdx];
+  disk.indirect_table[blocksCount+1].addr = (uint64) &disk.info[descIdx].status;
   disk.indirect_table[blocksCount+1].len = 1;
   disk.indirect_table[blocksCount+1].flags = VRING_DESC_F_WRITE;
   disk.indirect_table[blocksCount].next = blocksCount+1;
   disk.indirect_table[blocksCount+1].next = 0;
+
+  sb->disk = 1;
+  disk.info[descIdx].sb = sb;
+
+  disk.avail->ring[disk.avail->idx % NUM] = descIdx;
+
+  __sync_synchronize();
+
+  disk.avail->idx += 1;
+
+  __sync_synchronize();
+
+  *R(VIRTIO_MMIO_QUEUE_NOTIFY) = 0;
+
+  while (sb->disk == 1){
+    sleep(sb, &disk.vdisk_lock);
+  }
+
+  disk.info[descIdx].sb = 0;
+
+  free_desc(descIdx);
+
+  release(&disk.vdisk_lock);
 
 }
 
@@ -365,9 +389,15 @@ virtio_disk_intr()
       panic("virtio_disk_intr status");
 
     struct buf *b = disk.info[id].b;
-    b->disk = 0;   // disk is done with buf
-    wakeup(b);
-
+    struct segbuf *sb = disk.info[id].sb;
+    if (b){
+      b->disk = 0;   // disk is done with buf
+      wakeup(b);
+    }
+    else if (sb){
+      sb->disk = 0;
+      wakeup(sb);
+    }
     disk.used_idx += 1;
   }
 
