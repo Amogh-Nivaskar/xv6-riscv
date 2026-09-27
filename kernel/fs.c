@@ -18,17 +18,25 @@
 #include "proc.h"
 #include "sleeplock.h"
 #include "fs.h"
+#include "cache.h"
 #include "buf.h"
 #include "file.h"
 
 #define min(a, b) ((a) < (b) ? (a) : (b))
 // there should be one superblock per disk device, but we run with
 // only one device
-struct superblock sb;
+struct lfs_superblock sb;
+struct checkpoint cp;
+struct segsum_block sumblk;
+
+int nmeta;
+int nblocks;
+
+void checkpointinit(int dev, struct lfs_superblock *sb, struct checkpoint *cp);
 
 // Read the super block.
 static void
-readsb(int dev, struct superblock* sb)
+readsb(int dev, struct lfs_superblock* sb)
 {
   struct buf* bp;
 
@@ -43,9 +51,85 @@ void fsinit(int dev)
   readsb(dev, &sb);
   if (sb.magic != FSMAGIC)
     panic("invalid file system");
-  initlog(dev, &sb);
-  ireclaim(dev);
+
+  checkpointinit(dev, &sb, &cp);
+  cacheinit();
+
+  nmeta = 1 + 1 + 2 * sb.checkpointsize;
+  nblocks = FSSIZE - nmeta;
 }
+
+void checkpointinit(int dev, struct lfs_superblock *sb, struct checkpoint *cp){
+  struct buf* b;
+  struct checkpoint *cp1 = kalloc();
+  if (cp1 == 0){
+    panic("initCheckpoint: kalloc");
+  }
+  struct checkpoint *cp2 = kalloc();
+  if (cp2 == 0){
+    panic("initCheckpoint: kalloc");
+  }
+
+  char *p = (char*) cp1;
+  for (int i=0; i < sb->checkpointsize; i++){
+    b = bread(dev, sb->checkpoint1start + i);
+    memmove(p + (i*BSIZE), b->data, BSIZE);
+  }
+
+  p = (char*) cp2;
+  for (int i=0; i < sb->checkpointsize; i++){
+    b = bread(dev, sb->checkpoint2start + i);
+    memmove(p + (i*BSIZE), b->data, BSIZE);
+  }
+
+  if (cp1->timestamp > cp2->timestamp){
+    memmove(cp, cp1, sizeof(struct checkpoint));
+  }else{
+    memmove(cp, cp2, sizeof(struct checkpoint));
+  }
+
+  kfree(cp1);
+  kfree(cp2);
+}
+
+
+// SEGMENT WRITER
+
+uint checksum(void *data, int nbytes)
+{
+  uint *w = (uint*) data;
+  uint sum = 0;
+  int nwords = nbytes / sizeof(uint);
+  for(int i = 0; i < nwords; i++)
+    sum = (sum << 1 | sum >> 31) ^ w[i];
+  return sum;
+}
+
+uint segment_start_block(uint segnum)
+{
+  return nmeta + segnum * SSIZE;
+}
+
+uint next_free_segment(void)
+{
+  for(uint s = 0; s < SEG_NUM; s++){
+    if(cp.seg_freemap[s/8] & (1 << (s%8))){
+      cp.seg_freemap[s/8] &= ~(1 << (s%8));  // claim it: no longer free
+      return s;
+    }
+  }
+  panic("next_free_segment: no free segments");
+  return 0;  // unreachable
+}
+
+
+
+
+
+
+
+
+
 
 // Zero a block.
 static void

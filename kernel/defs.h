@@ -8,6 +8,10 @@ struct spinlock;
 struct sleeplock;
 struct stat;
 struct superblock;
+struct data_cache_node;
+struct indirect_cache_node;
+struct inode_cache_node;
+struct imap_cache_node;
 
 // bio.c
 void binit(void);
@@ -16,6 +20,21 @@ void brelse(struct buf *);
 void bwrite(struct buf *);
 void bpin(struct buf *);
 void bunpin(struct buf *);
+
+// cache.c
+void cacheinit(void);
+struct data_cache_node *data_cache_lookup(uint, uint);
+struct data_cache_node *data_cache_get_or_create(uint, uint);
+struct data_cache_node *data_cache_pop(uint, uint);
+struct indirect_cache_node *indirect_cache_lookup(uint);
+struct indirect_cache_node *indirect_cache_get_or_create(uint);
+struct indirect_cache_node *indirect_cache_pop(uint);
+struct inode_cache_node *inode_cache_lookup(uint);
+struct inode_cache_node *inode_cache_get_or_create(uint);
+struct inode_cache_node *inode_cache_pop(uint);
+struct imap_cache_node *imap_cache_lookup(uint);
+struct imap_cache_node *imap_cache_get_or_create(uint);
+struct imap_cache_node *imap_cache_pop(uint);
 
 // console.c
 void consoleinit(void);
