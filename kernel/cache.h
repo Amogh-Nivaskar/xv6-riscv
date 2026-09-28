@@ -22,24 +22,32 @@ struct data_cache_node {
   uint inum;                 // which file this data block belongs to
   uint fbn;                  // 0-indexed file block number
   char data[BSIZE];
+  uint refcnt;
+  struct sleeplock lock;
   struct data_cache_node *next;
 };
 
 struct indirect_cache_node {
   uint inum;                 // which file this indirect block belongs to
   uint addrs[NINDIRECT];     // data block addresses for fbn >= NDIRECT
+  uint refcnt;
+  struct sleeplock lock;
   struct indirect_cache_node *next;
 };
 
 struct inode_cache_node {
   uint inum;
   struct dinode din;
+  uint refcnt;
+  struct sleeplock lock;
   struct inode_cache_node *next;
 };
 
 struct imap_cache_node {
   uint idx;                           // index into checkpoint.imap_addr[]
   uint addrs[IMAP_ENTRIES_PER_BLK];   // inode block addresses for this range
+  uint refcnt;
+  struct sleeplock lock;
   struct imap_cache_node *next;
 };
 

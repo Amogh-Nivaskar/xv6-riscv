@@ -28,9 +28,15 @@
 struct lfs_superblock sb;
 struct checkpoint cp;
 struct segsum_block sumblk;
+char group_data[GROUP_CAP][BSIZE];
+int group_n;                      // blocks buffered in the current, unflushed group
+int cp_counter;
+
+struct spinloc cpLock;
 
 int nmeta;
 int nblocks;
+uint freeinode;
 
 void checkpointinit(int dev, struct lfs_superblock *sb, struct checkpoint *cp);
 
@@ -90,6 +96,7 @@ void checkpointinit(int dev, struct lfs_superblock *sb, struct checkpoint *cp){
 
   kfree(cp1);
   kfree(cp2);
+  initlock(&cpLock, 'cpLock');
 }
 
 
@@ -122,6 +129,121 @@ uint next_free_segment(void)
   return 0;  // unreachable
 }
 
+// how many more real (non-summary) blocks the in-progress group could
+// take before it would run past the end of the current segment.
+int group_capacity(void)
+{
+  int remaining = BLOCKS_PER_SEG - cp.fill_offset;  // includes room for the group's own summary block
+  if(remaining <= 1)
+    return 0;
+  int cap = remaining - 1;
+  if(cap > GROUP_CAP)
+    cap = GROUP_CAP;
+  return cap;
+}
+
+uint seg_write_block(uint tag1, uint tag2, void *data)
+{
+  if (group_n > 0 && group_n == group_capacity() ){
+    move_group_to_segbuf();
+  }
+
+  if (group_capacity() == 0){
+    cp.segment_num = next_free_segment();
+    cp.global_seq++;
+    cp.fill_offset = 0;
+  }
+
+
+
+
+
+}
+
+
+
+uint
+inode_alloc(ushort type)
+{
+  uint inum = freeinode++;
+  assert(inum <= NINODES);
+
+  struct inode_cache_node *inode_node = inode_cache_get_or_create(inum);
+
+  inode_node->din.type = xshort(type);
+  inode_node->din.nlink = xshort(1);
+  inode_node->din.size = xint(0);
+
+  struct imap_cache_node *imap_node = imap_cache_get_or_create(IMAP_BLK_IDX(inum));
+  imap_node->addrs[IMAP_OFFSET(inum)] = xint(0xFFFFFFFF);
+  
+  return inum;
+}
+
+
+struct imap_cache_node* imap_get(uint dev, uint idx){
+  struct imap_cache_node *imap_node = imap_cache_lookup(idx);
+
+  acquire(&cpLock);
+  uint imap_blockno = cp.imap_addr[idx];
+  release(&cpLock);
+
+  if (imap_node == 0 && imap_blockno != 0){
+    struct buf *b = bread(dev, imap_blockno);
+    imap_node = imap_cache_add(idx, b->data);
+    brelse(b);
+  }
+  return imap_node;
+}
+
+struct inode_cache_node* inode_get(uint dev, uint inum)
+{
+  struct imap_cache_node *imap_node = imap_get(dev, IMAP_BLK_IDX(inum));
+
+  if (imap_node == 0)
+    return 0;
+
+}
+
+
+#define min(a, b) ((a) < (b) ? (a) : (b))
+
+void
+inode_append(uint inum, void *xp, int n)
+{
+  char *p = (char*)xp;
+  uint fbn, off, n1;
+
+  struct inode_cache_node *inode_node = inode_cache_get_or_create(inum);
+  off = xint(inode_node->din.size);
+  // printf("append inum %d at off %d sz %d\n", inum, off, n);
+  while(n > 0){
+    fbn = off / BSIZE;
+    assert(fbn < MAXFILE);
+    if(fbn < NDIRECT){
+      if(xint(inode_node->din.addrs[fbn]) == 0){
+        inode_node->din.addrs[fbn] = xint(0xFFFFFFFF);
+      }
+    } else {
+      if(xint(inode_node->din.addrs[NDIRECT]) == 0){
+        inode_node->din.addrs[NDIRECT] = xint(0xFFFFFFFF);
+      }
+
+      struct indirect_cache_node *indirect_node = indirect_cache_get_or_create(inum);
+      indirect_node->addrs[fbn - NDIRECT] = xint(0xFFFFFFFF);
+    }
+
+    n1 = min(n, (fbn + 1) * BSIZE - off);
+
+    struct data_cache_node *data_node = data_cache_get_or_create(inum, fbn);
+    memmove(data_node->data + off - (fbn * BSIZE), p, n1);
+
+    n -= n1;
+    off += n1;
+    p += n1;
+  }
+  inode_node->din.size = xint(off);
+}
 
 
 
@@ -284,30 +406,7 @@ static struct inode* iget(uint dev, uint inum);
 // Mark it as allocated by  giving it type type.
 // Returns an unlocked but allocated and referenced inode,
 // or NULL if there is no free inode.
-struct inode*
-  ialloc(uint dev, short type)
-{
-  int inum;
-  struct buf* bp;
-  struct dinode* dip;
 
-  for (inum = 1; inum < sb.ninodes; inum++)
-  {
-    bp = bread(dev, IBLOCK(inum, sb));
-    dip = (struct dinode*)bp->data + inum % IPB;
-    if (dip->type == 0)
-    { // a free inode
-      memset(dip, 0, sizeof(*dip));
-      dip->type = type;
-      log_write(bp); // mark it allocated on the disk
-      brelse(bp);
-      return iget(dev, inum);
-    }
-    brelse(bp);
-  }
-  printf("ialloc: no inodes\n");
-  return 0;
-}
 
 // Copy a modified in-memory inode to disk.
 // Must be called after every change to an ip->xxx field

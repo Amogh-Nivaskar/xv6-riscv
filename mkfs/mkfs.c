@@ -7,6 +7,8 @@
 
 #define stat xv6_stat  // avoid clash with host struct stat
 #include "kernel/types.h"
+#include "kernel/spinlock.h"
+#include "kernel/sleeplock.h"
 #include "kernel/fs.h"
 #include "kernel/cache.h"
 #include "kernel/stat.h"

@@ -17,6 +17,7 @@
 #include "types.h"
 #include "param.h"
 #include "spinlock.h"
+#include "sleeplock.h"
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
@@ -38,6 +39,12 @@ void cacheinit(void)
   initlock(&indirectCacheLock, "indirectCacheLock");
   initlock(&inodeCacheLock, "inodeCacheLock");
   initlock(&imapCacheLock, "imapCacheLock");
+
+  initsleeplock(&dataCacheHead.lock, "dataCacheHead");
+  initsleeplock(&indirectCacheHead.lock, "indirectCacheHead");
+  initsleeplock(&inodeCacheHead.lock, "inodeCacheHead");
+  initsleeplock(&imapCacheHead.lock, "imapCacheHead");
+  
 }
 
 // caller must already hold dataCacheLock
@@ -45,8 +52,11 @@ static struct data_cache_node* data_cache_lookup_nolock(uint inum, uint fbn)
 {
   struct data_cache_node *nxt = dataCacheHead.next;
   while(nxt){
-    if(nxt->inum == inum && nxt->fbn == fbn)
+    if(nxt->inum == inum && nxt->fbn == fbn){
+      acquiresleep(&nxt->lock);
+      nxt->refcnt++;
       return nxt;
+    }
     nxt = nxt->next;
   }
   return 0;
@@ -81,7 +91,40 @@ struct data_cache_node* data_cache_get_or_create(uint inum, uint fbn)
   n->next = dataCacheHead.next;
   dataCacheHead.next = n;
   release(&dataCacheLock);
+  acquiresleep(&n->lock);
+  n->refcnt++;
+  return n;
+}
 
+// populates a new node from a block just read off disk (fs.c's job --
+// this file stays disk-unaware). Re-checks for an existing node under
+// the lock before inserting: another CPU could have raced ahead and
+// added this same key while we were off doing the (slow, sleeping) disk
+// read, in which case that node is authoritative and our just-read
+// content is discarded in favor of it.
+struct data_cache_node* data_cache_add(uint inum, uint fbn, char *data)
+{
+  acquire(&dataCacheLock);
+  struct data_cache_node *n = data_cache_lookup_nolock(inum, fbn);
+  if(n){
+    release(&dataCacheLock);
+    return n;
+  }
+
+  n = kalloc();
+  if(n == 0)
+    panic("data_cache_add: out of memory");
+
+  memset(n, 0, sizeof(*n));
+  n->inum = inum;
+  n->fbn = fbn;
+  memmove(n->data, data, BSIZE);
+
+  n->next = dataCacheHead.next;
+  dataCacheHead.next = n;
+  release(&dataCacheLock);
+  acquiresleep(&n->lock);
+  n->refcnt++;
   return n;
 }
 
@@ -93,8 +136,10 @@ struct data_cache_node* data_cache_pop(uint inum, uint fbn)
 
   while(cur){
     if(cur->inum == inum && cur->fbn == fbn){
+      acquiresleep(&cur->lock);
       prev->next = cur->next;
       release(&dataCacheLock);
+      cur->refcnt++;
       return cur;
     }
     prev = cur;
@@ -104,13 +149,24 @@ struct data_cache_node* data_cache_pop(uint inum, uint fbn)
   return 0;
 }
 
+void data_node_release(struct data_cache_node *node){
+  if(!holdingsleep(&node->lock))
+    panic("data_node_release");
+
+  node->refcnt--;
+  releasesleep(&node->lock);
+}
+
 // caller must already hold indirectCacheLock
 static struct indirect_cache_node* indirect_cache_lookup_nolock(uint inum)
 {
   struct indirect_cache_node *nxt = indirectCacheHead.next;
   while(nxt){
-    if(nxt->inum == inum)
+    if(nxt->inum == inum){
+      acquiresleep(&nxt->lock);
+      nxt->refcnt++;
       return nxt;
+    }
     nxt = nxt->next;
   }
   return 0;
@@ -139,11 +195,42 @@ struct indirect_cache_node* indirect_cache_get_or_create(uint inum)
 
   memset(n, 0, sizeof(*n));
   n->inum = inum;
+  initsleeplock(&n->lock, "indirect_cache_node");
 
   n->next = indirectCacheHead.next;
   indirectCacheHead.next = n;
   release(&indirectCacheLock);
+  acquiresleep(&n->lock);
+  n->refcnt++;
+  return n;
+}
 
+// see data_cache_add -- same reasoning (populate from disk, re-check
+// under the lock in case another CPU raced ahead of us).
+struct indirect_cache_node* indirect_cache_add(uint inum, uint *addrs)
+{
+  acquire(&indirectCacheLock);
+  struct indirect_cache_node *n = indirect_cache_lookup_nolock(inum);
+  if(n){
+    release(&indirectCacheLock);
+    return n;
+  }
+
+  n = kalloc();
+  if(n == 0)
+    panic("indirect_cache_add: out of memory");
+
+  memset(n, 0, sizeof(*n));
+  n->inum = inum;
+  initsleeplock(&n->lock, "indirect_cache_node");
+
+  memmove(n->addrs, addrs, sizeof(n->addrs));
+
+  n->next = indirectCacheHead.next;
+  indirectCacheHead.next = n;
+  release(&indirectCacheLock);
+  acquiresleep(&n->lock);
+  n->refcnt++;
   return n;
 }
 
@@ -155,8 +242,10 @@ struct indirect_cache_node* indirect_cache_pop(uint inum)
 
   while(cur){
     if(cur->inum == inum){
+      acquiresleep(&cur->lock);
       prev->next = cur->next;
       release(&indirectCacheLock);
+      cur->refcnt++;
       return cur;
     }
     prev = cur;
@@ -166,13 +255,24 @@ struct indirect_cache_node* indirect_cache_pop(uint inum)
   return 0;
 }
 
+void indirect_node_release(struct indirect_cache_node *node){
+  if(!holdingsleep(&node->lock))
+    panic("indirect_node_release");
+
+  node->refcnt--;
+  releasesleep(&node->lock);
+}
+
 // caller must already hold inodeCacheLock
 static struct inode_cache_node* inode_cache_lookup_nolock(uint inum)
 {
   struct inode_cache_node *nxt = inodeCacheHead.next;
   while(nxt){
-    if(nxt->inum == inum)
+    if(nxt->inum == inum){
+      acquiresleep(&nxt->lock);
+      nxt->refcnt++;
       return nxt;
+    }
     nxt = nxt->next;
   }
   return 0;
@@ -201,13 +301,64 @@ struct inode_cache_node* inode_cache_get_or_create(uint inum)
 
   memset(n, 0, sizeof(*n));
   n->inum = inum;
+  initsleeplock(&n->lock, "inode_cache_node");
 
   n->next = inodeCacheHead.next;
   inodeCacheHead.next = n;
   release(&inodeCacheLock);
-
+  acquiresleep(&n->lock);
+  n->refcnt++;
   return n;
 }
+
+// see data_cache_add -- same reasoning (populate from disk, re-check
+// under the lock in case another CPU raced ahead of us).
+struct inode_cache_node* inode_cache_add(uint inum, struct dinode *din)
+{
+  acquire(&inodeCacheLock);
+  struct inode_cache_node *n = inode_cache_lookup_nolock(inum);
+  if(n){
+    release(&inodeCacheLock);
+    return n;
+  }
+
+  n = kalloc();
+  if(n == 0)
+    panic("inode_cache_add: out of memory");
+
+  memset(n, 0, sizeof(*n));
+  n->inum = inum;
+  n->din = *din;
+  initsleeplock(&n->lock, "inode_cache_node");
+
+  n->next = inodeCacheHead.next;
+  inodeCacheHead.next = n;
+  release(&inodeCacheLock);
+  acquiresleep(&n->lock);
+  n->refcnt++;
+  return n;
+}
+
+// re-looks-up inum fresh under the lock and extracts one addrs[] entry
+// in the same critical section. index can be a direct fbn (0..NDIRECT-1)
+// or NDIRECT itself, for the indirect block's own pointer. Doesn't hand
+// back a node pointer, so it releases the node's sleeplock itself before
+// returning rather than leaving it checked out with nothing to release it.
+int inode_cache_get_addr(uint inum, uint index, uint *out)
+{
+  acquire(&inodeCacheLock);
+  struct inode_cache_node *n = inode_cache_lookup_nolock(inum);
+  if(n == 0){
+    release(&inodeCacheLock);
+    return 0;
+  }
+  *out = n->din.addrs[index];
+  n->refcnt--;
+  releasesleep(&n->lock);
+  release(&inodeCacheLock);
+  return 1;
+}
+
 
 struct inode_cache_node* inode_cache_pop(uint inum)
 {
@@ -217,8 +368,10 @@ struct inode_cache_node* inode_cache_pop(uint inum)
 
   while(cur){
     if(cur->inum == inum){
+      acquiresleep(&cur->lock);
       prev->next = cur->next;
       release(&inodeCacheLock);
+      cur->refcnt++;
       return cur;
     }
     prev = cur;
@@ -228,13 +381,24 @@ struct inode_cache_node* inode_cache_pop(uint inum)
   return 0;
 }
 
+void inode_node_release(struct inode_cache_node *node){
+  if(!holdingsleep(&node->lock))
+    panic("inode_node_release");
+
+  node->refcnt--;
+  releasesleep(&node->lock);
+}
+
 // caller must already hold imapCacheLock
 static struct imap_cache_node* imap_cache_lookup_nolock(uint idx)
 {
   struct imap_cache_node *nxt = imapCacheHead.next;
   while(nxt){
-    if(nxt->idx == idx)
+    if(nxt->idx == idx){
+      acquiresleep(&nxt->lock);
+      nxt->refcnt++;
       return nxt;
+    }
     nxt = nxt->next;
   }
   return 0;
@@ -263,13 +427,64 @@ struct imap_cache_node* imap_cache_get_or_create(uint idx)
 
   memset(n, 0, sizeof(*n));
   n->idx = idx;
+  initsleeplock(&n->lock, "imap_cache_node");
 
   n->next = imapCacheHead.next;
   imapCacheHead.next = n;
   release(&imapCacheLock);
-
+  acquiresleep(&n->lock);
+  n->refcnt++;
   return n;
 }
+
+// see data_cache_add -- same reasoning (populate from disk, re-check
+// under the lock in case another CPU raced ahead of us).
+struct imap_cache_node* imap_cache_add(uint idx, uint *addrs)
+{
+  acquire(&imapCacheLock);
+  struct imap_cache_node *n = imap_cache_lookup_nolock(idx);
+  if(n){
+    release(&imapCacheLock);
+    return n;
+  }
+
+  n = kalloc();
+  if(n == 0)
+    panic("imap_cache_add: out of memory");
+
+  memset(n, 0, sizeof(*n));
+  n->idx = idx;
+  initsleeplock(&n->lock, "imap_cache_node");
+  memmove(n->addrs, addrs, sizeof(n->addrs));
+
+  n->next = imapCacheHead.next;
+  imapCacheHead.next = n;
+  release(&imapCacheLock);
+  acquiresleep(&n->lock);
+  n->refcnt++;
+  return n;
+}
+
+// re-looks-up idx fresh under the lock (never trusts a stale pointer)
+// and extracts one entry from it in the same critical section. Doesn't
+// hand back a node pointer, so it releases the node's sleeplock itself
+// before returning rather than leaving it checked out with nothing to
+// release it.
+int imap_cache_get_addr(uint idx, uint offset, uint *out)
+{
+  acquire(&imapCacheLock);
+  struct imap_cache_node *n = imap_cache_lookup_nolock(idx);
+  if(n == 0){
+    release(&imapCacheLock);
+    return 0;
+  }
+  *out = n->addrs[offset];
+  n->refcnt--;
+  releasesleep(&n->lock);
+  release(&imapCacheLock);
+  return 1;
+}
+
 
 struct imap_cache_node* imap_cache_pop(uint idx)
 {
@@ -279,8 +494,10 @@ struct imap_cache_node* imap_cache_pop(uint idx)
 
   while(cur){
     if(cur->idx == idx){
+      acquiresleep(&cur->lock);
       prev->next = cur->next;
       release(&imapCacheLock);
+      cur->refcnt++;
       return cur;
     }
     prev = cur;
@@ -288,4 +505,12 @@ struct imap_cache_node* imap_cache_pop(uint idx)
   }
   release(&imapCacheLock);
   return 0;
+}
+
+void imap_node_release(struct imap_cache_node *node){
+  if(!holdingsleep(&node->lock))
+    panic("imap_node_release");
+
+  node->refcnt--;
+  releasesleep(&node->lock);
 }
