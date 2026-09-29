@@ -12,7 +12,9 @@ struct data_cache_node;
 struct indirect_cache_node;
 struct inode_cache_node;
 struct imap_cache_node;
+struct segsum_cache_node;
 struct dinode;
+struct segsum_block;
 
 // bio.c
 void binit(void);
@@ -37,15 +39,18 @@ void indirect_node_release(struct indirect_cache_node *);
 struct inode_cache_node *inode_cache_lookup(uint);
 struct inode_cache_node *inode_cache_get_or_create(uint);
 struct inode_cache_node *inode_cache_add(uint, struct dinode *);
-int inode_cache_get_addr(uint, uint, uint *);
 struct inode_cache_node *inode_cache_pop(uint);
 void inode_node_release(struct inode_cache_node *);
 struct imap_cache_node *imap_cache_lookup(uint);
 struct imap_cache_node *imap_cache_get_or_create(uint);
 struct imap_cache_node *imap_cache_add(uint, uint *);
-int imap_cache_get_addr(uint, uint, uint *);
 struct imap_cache_node *imap_cache_pop(uint);
 void imap_node_release(struct imap_cache_node *);
+struct segsum_cache_node *segsum_cache_lookup(uint, uint);
+struct segsum_cache_node *segsum_cache_get_or_create(uint, uint);
+struct segsum_cache_node *segsum_cache_add(uint, uint, struct segsum_block *);
+struct segsum_cache_node *segsum_cache_pop(uint, uint);
+void segsum_node_release(struct segsum_cache_node *);
 
 // console.c
 void consoleinit(void);

@@ -23,6 +23,7 @@ struct data_cache_node {
   uint fbn;                  // 0-indexed file block number
   char data[BSIZE];
   uint refcnt;
+  uint isdirty;               // needs flushing -- unset once written to a segment
   struct sleeplock lock;
   struct data_cache_node *next;
 };
@@ -31,6 +32,7 @@ struct indirect_cache_node {
   uint inum;                 // which file this indirect block belongs to
   uint addrs[NINDIRECT];     // data block addresses for fbn >= NDIRECT
   uint refcnt;
+  uint isdirty;               // needs flushing -- unset once written to a segment
   struct sleeplock lock;
   struct indirect_cache_node *next;
 };
@@ -39,6 +41,7 @@ struct inode_cache_node {
   uint inum;
   struct dinode din;
   uint refcnt;
+  uint isdirty;               // needs flushing -- unset once written to a segment
   struct sleeplock lock;
   struct inode_cache_node *next;
 };
@@ -47,8 +50,19 @@ struct imap_cache_node {
   uint idx;                           // index into checkpoint.imap_addr[]
   uint addrs[IMAP_ENTRIES_PER_BLK];   // inode block addresses for this range
   uint refcnt;
+  uint isdirty;               // needs flushing -- unset once written to a segment
   struct sleeplock lock;
   struct imap_cache_node *next;
+};
+
+struct segsum_cache_node {
+  uint segnum;                // which segment this is the summary for
+  uint groupidx;               // 0-indexed group position within that segment
+  struct segsum_block ssb;
+  uint refcnt;
+  uint isdirty;               // needs flushing -- unset once written to a segment
+  struct sleeplock lock;
+  struct segsum_cache_node *next;
 };
 
 // Which imap block (checkpoint.imap_addr[] index / imap_cache key) covers this inode.

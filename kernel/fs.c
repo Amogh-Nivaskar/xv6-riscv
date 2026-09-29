@@ -32,7 +32,7 @@ char group_data[GROUP_CAP][BSIZE];
 int group_n;                      // blocks buffered in the current, unflushed group
 int cp_counter;
 
-struct spinloc cpLock;
+struct spinlock cpLock;
 
 int nmeta;
 int nblocks;
@@ -96,7 +96,7 @@ void checkpointinit(int dev, struct lfs_superblock *sb, struct checkpoint *cp){
 
   kfree(cp1);
   kfree(cp2);
-  initlock(&cpLock, 'cpLock');
+  initlock(&cpLock, "cpLock");
 }
 
 
@@ -144,16 +144,6 @@ int group_capacity(void)
 
 uint seg_write_block(uint tag1, uint tag2, void *data)
 {
-  if (group_n > 0 && group_n == group_capacity() ){
-    move_group_to_segbuf();
-  }
-
-  if (group_capacity() == 0){
-    cp.segment_num = next_free_segment();
-    cp.global_seq++;
-    cp.fill_offset = 0;
-  }
-
 
 
 
@@ -208,6 +198,7 @@ struct inode_cache_node* inode_get(uint dev, uint inum)
     }
       
     uint inode_blockno = imap_node->addrs[IMAP_OFFSET(inum)];
+    imap_node_release(imap_node);
 
     if (inode_blockno == 0){
       return 0;
@@ -233,6 +224,7 @@ struct indirect_cache_node *indirect_get(uint dev, uint inum){
     }
 
     uint indirect_blockno = inode_node->din.addrs[NDIRECT];
+    inode_node_release(inode_node);
 
     if (indirect_blockno == 0){
       return 0;
@@ -259,6 +251,7 @@ struct data_cache_node *data_get(uint dev, uint inum, uint fbn){
       }
 
       data_blockno = inode_node->din.addrs[fbn];
+      inode_node_release(inode_node);
     }
     else{
       struct indirect_cache_node *indirect_node = indirect_get(dev, inum);
@@ -268,6 +261,7 @@ struct data_cache_node *data_get(uint dev, uint inum, uint fbn){
       }
 
       data_blockno = indirect_node->addrs[fbn-NDIRECT];
+      indirect_node_release(indirect_node);
     }
 
     if (data_blockno == 0){
