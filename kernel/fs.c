@@ -198,12 +198,92 @@ struct imap_cache_node* imap_get(uint dev, uint idx){
 
 struct inode_cache_node* inode_get(uint dev, uint inum)
 {
-  struct imap_cache_node *imap_node = imap_get(dev, IMAP_BLK_IDX(inum));
 
-  if (imap_node == 0)
-    return 0;
+  struct inode_cache_node *inode_node = inode_cache_lookup(inum);
 
+  if (inode_node == 0){
+    struct imap_cache_node *imap_node = imap_get(dev, IMAP_BLK_IDX(inum));
+    if (imap_node == 0){
+      return 0;
+    }
+      
+    uint inode_blockno = imap_node->addrs[IMAP_OFFSET(inum)];
+
+    if (inode_blockno == 0){
+      return 0;
+    }
+
+    struct buf *b = bread(dev, inode_blockno);
+    inode_node = inode_cache_add(inum, b->data);
+    brelse(b);
+  }
+
+  return inode_node;
 }
+
+struct indirect_cache_node *indirect_get(uint dev, uint inum){
+
+  struct indirect_cache_node *indirect_node = indirect_cache_lookup(inum);
+
+  if (indirect_node == 0){
+    struct inode_cache_node *inode_node = inode_get(dev, inum);
+
+    if (inode_node == 0){
+      return 0;
+    }
+
+    uint indirect_blockno = inode_node->din.addrs[NDIRECT];
+
+    if (indirect_blockno == 0){
+      return 0;
+    }
+
+    struct buf *b = bread(dev, indirect_blockno);
+    indirect_node = indirect_cache_add(inum, b->data);
+    brelse(b);
+  }
+
+  return indirect_node;
+}
+
+struct data_cache_node *data_get(uint dev, uint inum, uint fbn){
+  struct data_cache_node *data_node = data_cache_lookup(inum, fbn);
+  uint data_blockno;
+
+  if (data_node == 0){
+    if (fbn < NDIRECT){
+      struct inode_cache_node *inode_node = inode_get(dev, inum);
+
+      if (inode_node == 0){
+        return 0;
+      }
+
+      data_blockno = inode_node->din.addrs[fbn];
+    }
+    else{
+      struct indirect_cache_node *indirect_node = indirect_get(dev, inum);
+
+      if (indirect_node == 0){
+        return 0;
+      }
+
+      data_blockno = indirect_node->addrs[fbn-NDIRECT];
+    }
+
+    if (data_blockno == 0){
+      return 0;
+    }
+
+    struct buf *b = bread(dev, data_blockno);
+    data_node = data_cache_add(inum, fbn, b->data);
+    brelse(b);
+  }
+
+  return data_node;
+}
+
+
+
 
 
 #define min(a, b) ((a) < (b) ? (a) : (b))
