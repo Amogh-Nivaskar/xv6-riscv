@@ -37,6 +37,8 @@ struct lfs_superblock  {
 
 #define NINODES 64768
 
+#define NFLUSHTICKS 50
+
 // One entry per physical block in a segment, held in a segsum_block.
 // (0, 0)              -> this block is itself a segment summary block
 // (0, idx+1)          -> imap block, idx into checkpoint.imap_addr[]

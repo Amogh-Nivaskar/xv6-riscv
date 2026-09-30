@@ -162,6 +162,27 @@ void data_node_release(struct data_cache_node *node){
   releasesleep(&node->lock);
 }
 
+// finds the first dirty node, if any, and hands it back checked out --
+// unlike _pop(), does NOT unlink it. Caller (the flush path) is expected
+// to clear isdirty and call data_node_release() once it's been written
+// to a segment, leaving the node in the cache as a clean entry.
+struct data_cache_node* data_cache_lookup_dirty(void)
+{
+  acquire(&dataCacheLock);
+  struct data_cache_node *nxt = dataCacheHead.next;
+  while(nxt){
+    if(nxt->isdirty){
+      acquiresleep(&nxt->lock);
+      nxt->refcnt++;
+      release(&dataCacheLock);
+      return nxt;
+    }
+    nxt = nxt->next;
+  }
+  release(&dataCacheLock);
+  return 0;
+}
+
 // caller must already hold indirectCacheLock
 static struct indirect_cache_node* indirect_cache_lookup_nolock(uint inum)
 {
@@ -268,6 +289,25 @@ void indirect_node_release(struct indirect_cache_node *node){
 
   node->refcnt--;
   releasesleep(&node->lock);
+}
+
+// see data_cache_lookup_dirty -- same reasoning (found node stays in the
+// cache, caller clears isdirty and releases once it's been flushed).
+struct indirect_cache_node* indirect_cache_lookup_dirty(void)
+{
+  acquire(&indirectCacheLock);
+  struct indirect_cache_node *nxt = indirectCacheHead.next;
+  while(nxt){
+    if(nxt->isdirty){
+      acquiresleep(&nxt->lock);
+      nxt->refcnt++;
+      release(&indirectCacheLock);
+      return nxt;
+    }
+    nxt = nxt->next;
+  }
+  release(&indirectCacheLock);
+  return 0;
 }
 
 // caller must already hold inodeCacheLock
@@ -377,6 +417,25 @@ void inode_node_release(struct inode_cache_node *node){
   releasesleep(&node->lock);
 }
 
+// see data_cache_lookup_dirty -- same reasoning (found node stays in the
+// cache, caller clears isdirty and releases once it's been flushed).
+struct inode_cache_node* inode_cache_lookup_dirty(void)
+{
+  acquire(&inodeCacheLock);
+  struct inode_cache_node *nxt = inodeCacheHead.next;
+  while(nxt){
+    if(nxt->isdirty){
+      acquiresleep(&nxt->lock);
+      nxt->refcnt++;
+      release(&inodeCacheLock);
+      return nxt;
+    }
+    nxt = nxt->next;
+  }
+  release(&inodeCacheLock);
+  return 0;
+}
+
 // caller must already hold imapCacheLock
 static struct imap_cache_node* imap_cache_lookup_nolock(uint idx)
 {
@@ -482,6 +541,25 @@ void imap_node_release(struct imap_cache_node *node){
 
   node->refcnt--;
   releasesleep(&node->lock);
+}
+
+// see data_cache_lookup_dirty -- same reasoning (found node stays in the
+// cache, caller clears isdirty and releases once it's been flushed).
+struct imap_cache_node* imap_cache_lookup_dirty(void)
+{
+  acquire(&imapCacheLock);
+  struct imap_cache_node *nxt = imapCacheHead.next;
+  while(nxt){
+    if(nxt->isdirty){
+      acquiresleep(&nxt->lock);
+      nxt->refcnt++;
+      release(&imapCacheLock);
+      return nxt;
+    }
+    nxt = nxt->next;
+  }
+  release(&imapCacheLock);
+  return 0;
 }
 
 // caller must already hold segsumCacheLock

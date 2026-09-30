@@ -28,11 +28,15 @@
 struct lfs_superblock sb;
 struct checkpoint cp;
 struct segsum_block sumblk;
+
 char group_data[GROUP_CAP][BSIZE];
 int group_n;                      // blocks buffered in the current, unflushed group
-int cp_counter;
 
+int cp_counter;
 struct spinlock cpLock;
+
+uint dirtyBlocksCounter;
+uint lastFlushTicks;
 
 int nmeta;
 int nblocks;
@@ -142,10 +146,33 @@ int group_capacity(void)
   return cap;
 }
 
-uint seg_write_block(uint tag1, uint tag2, void *data)
+uint maybe_seg_flush()
 {
+  uint64 ticks = sys_uptime();
 
+  if (dirtyBlocksCounter < SSIZE - 5 && ticks - lastFlushTicks < NFLUSHTICKS){
+    return;
+  }
 
+  lastFlushTicks = ticks;
+
+  int offset = cp.fill_offset;
+
+  while (offset < SSIZE){
+
+    for (int i=1; i < NDATA_PER_SEGSUM; i++){
+      sumblk.entries[i].tag1 = 0;
+      sumblk.entries[i].tag2 = 0;
+    }
+    int dirtyBlks = 0;
+    
+    
+    while (dirtyBlks < GROUP_CAP){
+
+    }
+    
+
+  }
 
 
 }
