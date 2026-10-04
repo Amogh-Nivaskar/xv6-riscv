@@ -15,6 +15,7 @@ struct imap_cache_node;
 struct segsum_cache_node;
 struct dinode;
 struct segsum_block;
+struct segbuf;
 
 // bio.c
 void binit(void);
@@ -26,35 +27,50 @@ void bunpin(struct buf *);
 
 // cache.c
 void cacheinit(void);
+uint cache_dirty_count(void);
 struct data_cache_node *data_cache_lookup(uint, uint);
 struct data_cache_node *data_cache_get_or_create(uint, uint);
 struct data_cache_node *data_cache_add(uint, uint, char *);
 struct data_cache_node *data_cache_pop(uint, uint);
 void data_node_release(struct data_cache_node *);
+void data_node_mark_clean(struct data_cache_node *);
+uint data_cache_count(void);
+uint data_cache_evict_lru(void);
 struct data_cache_node *data_cache_lookup_dirty(void);
 struct indirect_cache_node *indirect_cache_lookup(uint);
 struct indirect_cache_node *indirect_cache_get_or_create(uint);
 struct indirect_cache_node *indirect_cache_add(uint, uint *);
 struct indirect_cache_node *indirect_cache_pop(uint);
 void indirect_node_release(struct indirect_cache_node *);
+void indirect_node_mark_clean(struct indirect_cache_node *);
+uint indirect_cache_count(void);
+uint indirect_cache_evict_lru(void);
 struct indirect_cache_node *indirect_cache_lookup_dirty(void);
 struct inode_cache_node *inode_cache_lookup(uint);
 struct inode_cache_node *inode_cache_get_or_create(uint);
 struct inode_cache_node *inode_cache_add(uint, struct dinode *);
 struct inode_cache_node *inode_cache_pop(uint);
 void inode_node_release(struct inode_cache_node *);
+void inode_node_mark_clean(struct inode_cache_node *);
+uint inode_cache_count(void);
+uint inode_cache_evict_lru(void);
 struct inode_cache_node *inode_cache_lookup_dirty(void);
 struct imap_cache_node *imap_cache_lookup(uint);
 struct imap_cache_node *imap_cache_get_or_create(uint);
 struct imap_cache_node *imap_cache_add(uint, uint *);
 struct imap_cache_node *imap_cache_pop(uint);
 void imap_node_release(struct imap_cache_node *);
+void imap_node_mark_clean(struct imap_cache_node *);
+uint imap_cache_count(void);
+uint imap_cache_evict_lru(void);
 struct imap_cache_node *imap_cache_lookup_dirty(void);
 struct segsum_cache_node *segsum_cache_lookup(uint, uint);
 struct segsum_cache_node *segsum_cache_get_or_create(uint, uint);
 struct segsum_cache_node *segsum_cache_add(uint, uint, struct segsum_block *);
 struct segsum_cache_node *segsum_cache_pop(uint, uint);
 void segsum_node_release(struct segsum_cache_node *);
+uint segsum_cache_count(void);
+uint segsum_cache_evict_all(void);
 
 // console.c
 void consoleinit(void);
@@ -231,6 +247,7 @@ void plic_complete(int);
 void virtio_disk_init(void);
 void virtio_disk_rw(struct buf *, int);
 void virtio_disk_intr(void);
+void virtio_disk_seg_w(struct segbuf *, int, uint64);
 
 // number of elements in fixed-size array
 #define NELEM(x) (sizeof(x) / sizeof((x)[0]))

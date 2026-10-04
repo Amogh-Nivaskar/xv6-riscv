@@ -24,6 +24,7 @@ struct data_cache_node {
   char data[BSIZE];
   uint refcnt;
   uint isdirty;               // needs flushing -- unset once written to a segment
+  uint lastAccessTicks;        // ticks at last lookup/create -- LRU eviction candidate ranking
   struct sleeplock lock;
   struct data_cache_node *next;
 };
@@ -33,6 +34,7 @@ struct indirect_cache_node {
   uint addrs[NINDIRECT];     // data block addresses for fbn >= NDIRECT
   uint refcnt;
   uint isdirty;               // needs flushing -- unset once written to a segment
+  uint lastAccessTicks;        // ticks at last lookup/create -- LRU eviction candidate ranking
   struct sleeplock lock;
   struct indirect_cache_node *next;
 };
@@ -42,6 +44,7 @@ struct inode_cache_node {
   struct dinode din;
   uint refcnt;
   uint isdirty;               // needs flushing -- unset once written to a segment
+  uint lastAccessTicks;        // ticks at last lookup/create -- LRU eviction candidate ranking
   struct sleeplock lock;
   struct inode_cache_node *next;
 };
@@ -51,6 +54,7 @@ struct imap_cache_node {
   uint addrs[IMAP_ENTRIES_PER_BLK];   // inode block addresses for this range
   uint refcnt;
   uint isdirty;               // needs flushing -- unset once written to a segment
+  uint lastAccessTicks;        // ticks at last lookup/create -- LRU eviction candidate ranking
   struct sleeplock lock;
   struct imap_cache_node *next;
 };
@@ -61,6 +65,7 @@ struct segsum_cache_node {
   struct segsum_block ssb;
   uint refcnt;
   uint isdirty;               // needs flushing -- unset once written to a segment
+  uint lastAccessTicks;        // ticks at last lookup/create -- LRU eviction candidate ranking
   struct sleeplock lock;
   struct segsum_cache_node *next;
 };
