@@ -70,6 +70,8 @@ struct segsum_entry {
 // block could not.
 #define NDATA_PER_SEGSUM 127                     // logical positions covered (0 = self)
 #define BLOCKS_PER_SEG SSIZE
+#define CACHE_EVICT_THRESHOLD (2 * SSIZE)
+#define CACHE_EVICT_TARGET SSIZE
 
 struct segsum_block {
   struct segsum_entry entries[NDATA_PER_SEGSUM - 1];  // logical positions 1..126

@@ -28,14 +28,15 @@
 struct lfs_superblock sb;
 struct checkpoint cp;
 struct segsum_block sumblk;
+struct segbuf seg;
 
 char group_data[GROUP_CAP][BSIZE];
 int group_n;                      // blocks buffered in the current, unflushed group
 
 int cp_counter;
 struct spinlock cpLock;
+struct sleeplock flushLock;
 
-uint dirtyBlocksCounter;
 uint lastFlushTicks;
 
 int nmeta;
@@ -64,6 +65,8 @@ void fsinit(int dev)
 
   checkpointinit(dev, &sb, &cp);
   cacheinit();
+  initsleeplock(&seg.lock, "segLock");
+  initsleeplock(&flushLock, "flushLock");
 
   nmeta = 1 + 1 + 2 * sb.checkpointsize;
   nblocks = FSSIZE - nmeta;
@@ -121,11 +124,19 @@ uint segment_start_block(uint segnum)
   return nmeta + segnum * SSIZE;
 }
 
+void free_segment(uint segNo){
+  cp.seg_freemap[segNo/8] &= (1 << (segNo%8));
+}
+
+void claim_segment(uint segNo){
+  cp.seg_freemap[segNo/8] &= ~(1 << (segNo%8));
+}
+
 uint next_free_segment(void)
 {
   for(uint s = 0; s < SEG_NUM; s++){
     if(cp.seg_freemap[s/8] & (1 << (s%8))){
-      cp.seg_freemap[s/8] &= ~(1 << (s%8));  // claim it: no longer free
+      claim_segment(s);  // claim it: no longer free
       return s;
     }
   }
@@ -135,9 +146,9 @@ uint next_free_segment(void)
 
 // how many more real (non-summary) blocks the in-progress group could
 // take before it would run past the end of the current segment.
-int group_capacity(void)
+int group_capacity(int offset)
 {
-  int remaining = BLOCKS_PER_SEG - cp.fill_offset;  // includes room for the group's own summary block
+  int remaining = SSIZE - offset;  // includes room for the group's own summary block
   if(remaining <= 1)
     return 0;
   int cap = remaining - 1;
@@ -146,36 +157,294 @@ int group_capacity(void)
   return cap;
 }
 
-uint maybe_seg_flush()
-{
-  uint64 ticks = sys_uptime();
+void move_group_to_segbuf(int segOffset, int blocks){
+  
+  acquiresleep(&seg.lock);
 
-  if (dirtyBlocksCounter < SSIZE - 5 && ticks - lastFlushTicks < NFLUSHTICKS){
+  int startOffset = segOffset;
+  int endOffset = startOffset + blocks;
+  int pageOffset = segOffset % 4;
+  int pageBase = segOffset - pageOffset;
+  uint64 pageAddr;
+
+  if (seg.addrs[pageBase] == 0){
+    pageAddr = (uint64) kalloc();
+  }else{
+    pageAddr = seg.addrs[pageBase];
+  }
+
+  uint64 targetAddr = pageAddr + (pageOffset * BSIZE);
+  memmove((void*) targetAddr, &sumblk, BSIZE);
+
+  seg.addrs[pageBase + pageOffset] = targetAddr;
+
+  segOffset += 1;
+
+  while (segOffset < endOffset){
+    pageOffset = segOffset % 4;
+    pageBase = segOffset - pageOffset;
+
+    if (seg.addrs[pageBase] == 0){
+      pageAddr = (uint64) kalloc();
+    }else{
+      pageAddr = seg.addrs[pageBase];
+    }
+
+    targetAddr = pageAddr + (pageOffset * BSIZE);
+    memmove((void*) targetAddr, group_data[segOffset-startOffset], BSIZE);
+
+    seg.addrs[pageBase + pageOffset] = targetAddr;
+
+    segOffset += 1;
+  }
+
+  releasesleep(&seg.lock);
+
+}
+
+// Gathers up to a group's worth of dirty blocks (data, then indirect,
+// then inode, then imap -- the fixed flush order) at segment offset
+// `offset`, migrates them to the segbuf, and returns how many real
+// blocks were gathered (0 if nothing was dirty).
+int build_group(int offset)
+{
+  for (int i=0; i < NDATA_PER_SEGSUM - 1; i++){
+    sumblk.entries[i].tag1 = 0;
+    sumblk.entries[i].tag2 = 0;
+  }
+
+  int idx = 0; // index in the group list
+
+  while (idx < group_capacity(offset)){
+    struct data_cache_node *data_node = data_cache_lookup_dirty();
+
+    if (data_node == 0){
+      break;
+    }
+
+    memmove(group_data[idx], data_node->data, BSIZE);
+
+    sumblk.entries[idx].tag1 = data_node->inum;
+    sumblk.entries[idx].tag2 = data_node->fbn+1;
+    data_node_mark_clean(data_node);
+    data_node_release(data_node);
+    idx += 1;
+  }
+
+
+  while (idx < group_capacity(offset)){
+    struct indirect_cache_node *indirect_node = indirect_cache_lookup_dirty();
+
+    if (indirect_node == 0){
+      break;
+    }
+
+    memmove(group_data[idx], indirect_node->addrs, BSIZE);
+
+    sumblk.entries[idx].tag1 = indirect_node->inum;
+    sumblk.entries[idx].tag2 = 0xFFFFFFFF;
+    indirect_node_mark_clean(indirect_node);
+    indirect_node_release(indirect_node);
+    idx += 1;
+  }
+
+  while (idx < group_capacity(offset)){
+    struct inode_cache_node *inode_node = inode_cache_lookup_dirty();
+
+    if (inode_node == 0){
+      break;
+    }
+
+    memset(group_data[idx], 0, BSIZE);
+    memmove(group_data[idx], &inode_node->din, sizeof(struct dinode));
+
+    sumblk.entries[idx].tag1 = inode_node->inum;
+    sumblk.entries[idx].tag2 = 0;
+    inode_node_mark_clean(inode_node);
+    inode_node_release(inode_node);
+    idx += 1;
+  }
+
+
+  while (idx < group_capacity(offset)){
+    struct imap_cache_node *imap_node = imap_cache_lookup_dirty();
+
+    if (imap_node == 0){
+      break;
+    }
+
+    memmove(group_data[idx], imap_node->addrs, BSIZE);
+
+    sumblk.entries[idx].tag1 = 0;
+    sumblk.entries[idx].tag2 = imap_node->idx+1;
+    imap_node_mark_clean(imap_node);
+    imap_node_release(imap_node);
+    idx += 1;
+  }
+
+  // No dirty blocks were found at all
+  if (idx == 0){
+    return 0;
+  }
+
+  acquire(&cpLock);
+  sumblk.seq = cp.global_seq;
+  release(&cpLock);
+  sumblk.data_checksum = checksum(group_data, idx * BSIZE);
+  sumblk.self_checksum = checksum(&sumblk, sizeof(sumblk) - sizeof(uint));
+
+  // constructs segment summary block and
+  // migrates group to the `segbuf`
+  move_group_to_segbuf(offset, idx+1);
+
+  return idx;
+}
+
+
+
+
+uint get_cacheSize(){
+  return segsum_cache_count() + data_cache_count() + indirect_cache_count() + inode_cache_count() + imap_cache_count();
+}
+
+void lru_cache_eviction(){
+
+  if (get_cacheSize() <= CACHE_EVICT_THRESHOLD){
     return;
   }
 
-  lastFlushTicks = ticks;
+  int evictedThisTurn = -1;
 
+  while (get_cacheSize() > CACHE_EVICT_THRESHOLD && (evictedThisTurn == -1 || evictedThisTurn > 0)){
+    
+    evictedThisTurn = 0;
+    if (segsum_cache_count() > 0){
+      evictedThisTurn = segsum_cache_evict_all();
+    }
+
+    if (get_cacheSize() <= CACHE_EVICT_TARGET){
+      return;
+    }
+
+    int evictDataBlocks = data_cache_count()/2;
+    for (int i=0; i < evictDataBlocks; i++){
+      int x = data_cache_evict_lru();
+      if (x == 0){
+        break;
+      }
+      evictedThisTurn += x;
+    }
+
+    if (get_cacheSize() <= CACHE_EVICT_TARGET){
+      return;
+    }
+
+    int evictIndirectBlocks = indirect_cache_count()/2;
+    for (int i=0; i < evictIndirectBlocks; i++){
+      int x = indirect_cache_evict_lru();
+      if (x == 0){
+        break;
+      }
+      evictedThisTurn += x;
+    }
+
+    if (get_cacheSize() <= CACHE_EVICT_TARGET){
+      return;
+    }
+
+    int evictInodeBlocks = inode_cache_count()/2;
+    for (int i=0; i < evictInodeBlocks; i++){
+      int x = inode_cache_evict_lru();
+      if (x == 0){
+        break;
+      }
+      evictedThisTurn += x;
+    }
+
+    if (get_cacheSize() <= CACHE_EVICT_TARGET){
+      return;
+    }
+
+    int evictImapBlocks = imap_cache_count()/2;
+    for (int i=0; i < evictImapBlocks; i++){
+      int x = imap_cache_evict_lru();
+      if (x == 0){
+        break;
+      }
+      evictedThisTurn += x;
+    }
+
+    if (get_cacheSize() <= CACHE_EVICT_TARGET){
+      return;
+    }
+
+  }
+  
+}
+
+void maybe_flush_dirty()
+{
+  uint currTicks;
+
+  acquire(&tickslock);
+  currTicks = ticks;
+  release(&tickslock);
+
+  if (cache_dirty_count() < SSIZE - 5 && currTicks - lastFlushTicks < NFLUSHTICKS){
+    return;
+  }
+
+  lastFlushTicks = currTicks;
+
+  acquiresleep(&flushLock);
+
+  acquire(&cpLock);
   int offset = cp.fill_offset;
+  release(&cpLock);
 
-  while (offset < SSIZE){
+  while (cache_dirty_count() > 0){
 
-    for (int i=1; i < NDATA_PER_SEGSUM; i++){
-      sumblk.entries[i].tag1 = 0;
-      sumblk.entries[i].tag2 = 0;
+    if (offset == SSIZE){
+      int s = next_free_segment();
+      acquire(&cpLock);
+      cp.fill_offset = 0;
+      cp.segment_num = s;
+      cp.global_seq += 1;
+      release(&cpLock);
+      offset = 0;
+
+      acquiresleep(&seg.lock);
+      for (int i=0; i<SSIZE; i++){
+        seg.addrs[i] = 0;
+      }
+      releasesleep(&seg.lock);
     }
-    int dirtyBlks = 0;
-    
-    
-    while (dirtyBlks < GROUP_CAP){
 
+    while (offset < SSIZE){
+      int idx = build_group(offset);
+
+      // No dirty blocks were found at all, break early
+      if (idx == 0){
+        break;
+      }
+
+      // '+1' for segment summary block
+      offset += idx + 1;
     }
-    
 
+    virtio_disk_seg_w(&seg, offset - cp.fill_offset, cp.fill_offset);
   }
 
 
+  acquire(&cpLock);
+  cp.fill_offset = offset;
+  release(&cpLock);
+
+  releasesleep(&flushLock);
+  
+  lru_cache_eviction();
 }
+
 
 
 
@@ -183,16 +452,19 @@ uint
 inode_alloc(ushort type)
 {
   uint inum = freeinode++;
-  assert(inum <= NINODES);
+
+  if (inum > NINODES){
+    panic("inode_alloc: inum out of bounds");
+  }
 
   struct inode_cache_node *inode_node = inode_cache_get_or_create(inum);
 
-  inode_node->din.type = xshort(type);
-  inode_node->din.nlink = xshort(1);
-  inode_node->din.size = xint(0);
+  inode_node->din.type = type;
+  inode_node->din.nlink = 1;
+  inode_node->din.size = 0;
 
   struct imap_cache_node *imap_node = imap_cache_get_or_create(IMAP_BLK_IDX(inum));
-  imap_node->addrs[IMAP_OFFSET(inum)] = xint(0xFFFFFFFF);
+  imap_node->addrs[IMAP_OFFSET(inum)] = 0xFFFFFFFF;
   
   return inum;
 }
@@ -316,22 +588,26 @@ inode_append(uint inum, void *xp, int n)
   uint fbn, off, n1;
 
   struct inode_cache_node *inode_node = inode_cache_get_or_create(inum);
-  off = xint(inode_node->din.size);
+  off = inode_node->din.size;
   // printf("append inum %d at off %d sz %d\n", inum, off, n);
   while(n > 0){
     fbn = off / BSIZE;
-    assert(fbn < MAXFILE);
+
+    if (fbn >= MAXFILE){
+      panic("inode_append: fbn out of bounds");
+    }
+
     if(fbn < NDIRECT){
-      if(xint(inode_node->din.addrs[fbn]) == 0){
-        inode_node->din.addrs[fbn] = xint(0xFFFFFFFF);
+      if(inode_node->din.addrs[fbn] == 0){
+        inode_node->din.addrs[fbn] = 0xFFFFFFFF;
       }
     } else {
-      if(xint(inode_node->din.addrs[NDIRECT]) == 0){
-        inode_node->din.addrs[NDIRECT] = xint(0xFFFFFFFF);
+      if(inode_node->din.addrs[NDIRECT] == 0){
+        inode_node->din.addrs[NDIRECT] = 0xFFFFFFFF;
       }
 
       struct indirect_cache_node *indirect_node = indirect_cache_get_or_create(inum);
-      indirect_node->addrs[fbn - NDIRECT] = xint(0xFFFFFFFF);
+      indirect_node->addrs[fbn - NDIRECT] = 0xFFFFFFFF;
     }
 
     n1 = min(n, (fbn + 1) * BSIZE - off);
@@ -343,7 +619,7 @@ inode_append(uint inum, void *xp, int n)
     off += n1;
     p += n1;
   }
-  inode_node->din.size = xint(off);
+  inode_node->din.size = off;
 }
 
 
@@ -802,18 +1078,19 @@ int readi(struct inode* ip, int user_dst, uint64 dst, uint off, uint n)
 
   for (tot = 0; tot < n; tot += m, off += m, dst += m)
   {
-    uint addr = bmap(ip, off / BSIZE);
-    if (addr == 0)
+    int fbn = off/BSIZE;
+    struct data_cache_node* data_node = data_get(ip->dev, ip->inum, fbn);
+    if (data_node == 0)
       break;
-    bp = bread(ip->dev, addr);
+    
     m = min(n - tot, BSIZE - off % BSIZE);
-    if (either_copyout(user_dst, dst, bp->data + (off % BSIZE), m) == -1)
+    if (either_copyout(user_dst, dst, data_node->data + (off % BSIZE), m) == -1)
     {
-      brelse(bp);
+      data_node_release(data_node);
       tot = -1;
       break;
     }
-    brelse(bp);
+    data_node_release(data_node);
   }
   return tot;
 }
@@ -837,27 +1114,24 @@ int writei(struct inode* ip, int user_src, uint64 src, uint off, uint n)
 
   for (tot = 0; tot < n; tot += m, off += m, src += m)
   {
-    uint addr = bmap(ip, off / BSIZE);
-    if (addr == 0)
+    int fbn = off/BSIZE;
+    struct data_cache_node* data_node = data_get(ip->dev, ip->inum, fbn);
+    if (data_node == 0)
       break;
-    bp = bread(ip->dev, addr);
+
     m = min(n - tot, BSIZE - off % BSIZE);
-    if (either_copyin(bp->data + (off % BSIZE), user_src, src, m) == -1)
+    if (either_copyin(data_node->data + (off % BSIZE), user_src, src, m) == -1)
     {
-      brelse(bp);
+      data_node_release(data_node);
       break;
     }
-    log_write(bp);
-    brelse(bp);
+    data_node_release(data_node);
   }
 
   if (off > ip->size)
     ip->size = off;
 
-  // write the i-node back to disk even if the size didn't change
-  // because the loop above might have called bmap() and added a new
-  // block to ip->addrs[].
-  iupdate(ip);
+  maybe_flush_dirty();
 
   return tot;
 }
