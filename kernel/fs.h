@@ -130,18 +130,6 @@ struct dinode {
   uint addrs[NDIRECT+1];   // Data block addresses
 };
 
-// Inodes per block.
-#define IPB           (BSIZE / sizeof(struct dinode))
-
-// Block containing inode i
-#define IBLOCK(i, sb)     ((i) / IPB + sb.inodestart)
-
-// Bitmap bits per block
-#define BPB           (BSIZE*8)
-
-// Block of free map containing bit for block b
-#define BBLOCK(b, sb) ((b)/BPB + sb.bmapstart)
-
 // Directory is a file containing a sequence of dirent structures.
 #define DIRSIZ 14
 

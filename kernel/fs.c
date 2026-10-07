@@ -44,6 +44,7 @@ int nblocks;
 uint freeinode;
 
 void checkpointinit(int dev, struct lfs_superblock *sb, struct checkpoint *cp);
+static struct inode* iget(uint dev, uint inum);
 
 // Read the super block.
 static void
@@ -465,8 +466,21 @@ inode_alloc(ushort type)
 
   struct imap_cache_node *imap_node = imap_cache_get_or_create(IMAP_BLK_IDX(inum));
   imap_node->addrs[IMAP_OFFSET(inum)] = 0xFFFFFFFF;
-  
+  imap_node_release(imap_node);
+
+  inode_node_release(inode_node);
+
   return inum;
+}
+
+// Allocate an inode on device dev.
+// Mark it as allocated by giving it type type.
+// Returns an unlocked but allocated and referenced inode,
+// or NULL if there is no free inode.
+struct inode* ialloc(uint dev, short type)
+{
+  uint inum = inode_alloc(type);
+  return iget(dev, inum);
 }
 
 
@@ -479,7 +493,7 @@ struct imap_cache_node* imap_get(uint dev, uint idx){
 
   if (imap_node == 0 && imap_blockno != 0){
     struct buf *b = bread(dev, imap_blockno);
-    imap_node = imap_cache_add(idx, b->data);
+    imap_node = imap_cache_add(idx, (uint*)b->data);
     brelse(b);
   }
   return imap_node;
@@ -504,7 +518,7 @@ struct inode_cache_node* inode_get(uint dev, uint inum)
     }
 
     struct buf *b = bread(dev, inode_blockno);
-    inode_node = inode_cache_add(inum, b->data);
+    inode_node = inode_cache_add(inum, (struct dinode*)b->data);
     brelse(b);
   }
 
@@ -530,7 +544,7 @@ struct indirect_cache_node *indirect_get(uint dev, uint inum){
     }
 
     struct buf *b = bread(dev, indirect_blockno);
-    indirect_node = indirect_cache_add(inum, b->data);
+    indirect_node = indirect_cache_add(inum, (uint*)b->data);
     brelse(b);
   }
 
@@ -568,7 +582,7 @@ struct data_cache_node *data_get(uint dev, uint inum, uint fbn){
     }
 
     struct buf *b = bread(dev, data_blockno);
-    data_node = data_cache_add(inum, fbn, b->data);
+    data_node = data_cache_add(inum, fbn, (char*)b->data);
     brelse(b);
   }
 
@@ -629,67 +643,6 @@ inode_append(uint inum, void *xp, int n)
 
 
 
-
-// Zero a block.
-static void
-bzero(int dev, int bno)
-{
-  struct buf* bp;
-
-  bp = bread(dev, bno);
-  memset(bp->data, 0, BSIZE);
-  log_write(bp);
-  brelse(bp);
-}
-
-// Blocks.
-
-// Allocate a zeroed disk block.
-// returns 0 if out of disk space.
-static uint
-balloc(uint dev)
-{
-  int b, bi, m;
-  struct buf* bp;
-
-  bp = 0;
-  for (b = 0; b < sb.size; b += BPB)
-  {
-    bp = bread(dev, BBLOCK(b, sb));
-    for (bi = 0; bi < BPB && b + bi < sb.size; bi++)
-    {
-      m = 1 << (bi % 8);
-      if ((bp->data[bi / 8] & m) == 0)
-      {                        // Is block free?
-        bp->data[bi / 8] |= m; // Mark block in use.
-        log_write(bp);
-        brelse(bp);
-        bzero(dev, b + bi);
-        return b + bi;
-      }
-    }
-    brelse(bp);
-  }
-  printf("balloc: out of blocks\n");
-  return 0;
-}
-
-// Free a disk block.
-static void
-bfree(int dev, uint b)
-{
-  struct buf* bp;
-  int bi, m;
-
-  bp = bread(dev, BBLOCK(b, sb));
-  bi = b % BPB;
-  m = 1 << (bi % 8);
-  if ((bp->data[bi / 8] & m) == 0)
-    panic("freeing free block");
-  bp->data[bi / 8] &= ~m;
-  log_write(bp);
-  brelse(bp);
-}
 
 // Inodes.
 //
@@ -785,25 +738,26 @@ static struct inode* iget(uint dev, uint inum);
 // or NULL if there is no free inode.
 
 
-// Copy a modified in-memory inode to disk.
-// Must be called after every change to an ip->xxx field
-// that lives on disk.
+// Copy a modified in-memory inode to the LFS inode cache, marking it
+// dirty so the next flush persists it. Must be called after every
+// change to an ip->xxx field that lives on disk.
 // Caller must hold ip->lock.
 void iupdate(struct inode* ip)
 {
-  struct buf* bp;
-  struct dinode* dip;
+  struct inode_cache_node* inode_node = inode_get(ip->dev, ip->inum);
+  if (inode_node == 0){
+    panic("iupdate: inode not found");
+  }
 
-  bp = bread(ip->dev, IBLOCK(ip->inum, sb));
-  dip = (struct dinode*)bp->data + ip->inum % IPB;
-  dip->type = ip->type;
-  dip->major = ip->major;
-  dip->minor = ip->minor;
-  dip->nlink = ip->nlink;
-  dip->size = ip->size;
-  memmove(dip->addrs, ip->addrs, sizeof(ip->addrs));
-  log_write(bp);
-  brelse(bp);
+  inode_node->din.type = ip->type;
+  inode_node->din.major = ip->major;
+  inode_node->din.minor = ip->minor;
+  inode_node->din.nlink = ip->nlink;
+  inode_node->din.size = ip->size;
+  memmove(inode_node->din.addrs, ip->addrs, sizeof(ip->addrs));
+  inode_node->isdirty = 1;
+
+  inode_node_release(inode_node);
 }
 
 // Find the inode with number inum on device dev
@@ -859,7 +813,6 @@ struct inode*
 // Reads the inode from disk if necessary.
 void ilock(struct inode* ip)
 {
-  struct buf* bp;
   struct dinode* dip;
 
   if (ip == 0 || ip->ref < 1)
@@ -869,15 +822,18 @@ void ilock(struct inode* ip)
 
   if (ip->valid == 0)
   {
-    bp = bread(ip->dev, IBLOCK(ip->inum, sb));
-    dip = (struct dinode*)bp->data + ip->inum % IPB;
+    struct inode_cache_node* inode_node = inode_get(ip->dev, ip->inum);
+    if (inode_node == 0){
+      panic("ilock: inode not found");
+    }
+    dip = &inode_node->din;
     ip->type = dip->type;
     ip->major = dip->major;
     ip->minor = dip->minor;
     ip->nlink = dip->nlink;
     ip->size = dip->size;
     memmove(ip->addrs, dip->addrs, sizeof(ip->addrs));
-    brelse(bp);
+    inode_node_release(inode_node);
     ip->valid = 1;
     if (ip->type == 0)
       panic("ilock: no type");
@@ -916,9 +872,11 @@ void iput(struct inode* ip)
 
     itrunc(ip);
     ip->type = 0;
-    iupdate(ip);
-    ip->valid = 0;
-
+    struct inode_cache_node* inode_node = inode_get(ip->dev, ip->inum);
+    inode_node->din.type = 0;
+    inode_node->isdirty = 1;
+    inode_node_release(inode_node);
+    
     releasesleep(&ip->lock);
 
     acquire(&itable.lock);
@@ -935,30 +893,6 @@ void iunlockput(struct inode* ip)
   iput(ip);
 }
 
-void ireclaim(int dev)
-{
-  for (int inum = 1; inum < sb.ninodes; inum++)
-  {
-    struct inode* ip = 0;
-    struct buf* bp = bread(dev, IBLOCK(inum, sb));
-    struct dinode* dip = (struct dinode*)bp->data + inum % IPB;
-    if (dip->type != 0 && dip->nlink == 0)
-    { // is an orphaned inode
-      printf("ireclaim: orphaned inode %d\n", inum);
-      ip = iget(dev, inum);
-    }
-    brelse(bp);
-    if (ip)
-    {
-      begin_op();
-      ilock(ip);
-      iunlock(ip);
-      iput(ip);
-      end_op();
-    }
-  }
-}
-
 // Inode content
 //
 // The content (data) associated with each inode is stored
@@ -966,89 +900,23 @@ void ireclaim(int dev)
 // are listed in ip->addrs[].  The next NINDIRECT blocks are
 // listed in block ip->addrs[NDIRECT].
 
-// Return the disk block address of the nth block in inode ip.
-// If there is no such block, bmap allocates one.
-// returns 0 if out of disk space.
-static uint
-bmap(struct inode* ip, uint bn)
-{
-  uint addr, * a;
-  struct buf* bp;
-
-  if (bn < NDIRECT)
-  {
-    if ((addr = ip->addrs[bn]) == 0)
-    {
-      addr = balloc(ip->dev);
-      if (addr == 0)
-        return 0;
-      ip->addrs[bn] = addr;
-    }
-    return addr;
-  }
-  bn -= NDIRECT;
-
-  if (bn < NINDIRECT)
-  {
-    // Load indirect block, allocating if necessary.
-    if ((addr = ip->addrs[NDIRECT]) == 0)
-    {
-      addr = balloc(ip->dev);
-      if (addr == 0)
-        return 0;
-      ip->addrs[NDIRECT] = addr;
-    }
-    bp = bread(ip->dev, addr);
-    a = (uint*)bp->data;
-    if ((addr = a[bn]) == 0)
-    {
-      addr = balloc(ip->dev);
-      if (addr)
-      {
-        a[bn] = addr;
-        log_write(bp);
-      }
-    }
-    brelse(bp);
-    return addr;
-  }
-
-  panic("bmap: out of range");
-}
-
 // Truncate inode (discard contents).
 // Caller must hold ip->lock.
 void itrunc(struct inode* ip)
 {
-  int i, j;
-  struct buf* bp;
-  uint* a;
+  struct inode_cache_node* inode_node = inode_get(ip->dev, ip->inum);
 
-  for (i = 0; i < NDIRECT; i++)
-  {
-    if (ip->addrs[i])
-    {
-      bfree(ip->dev, ip->addrs[i]);
-      ip->addrs[i] = 0;
-    }
+  if (inode_node == 0){
+    panic("itrunc: inode not found");
   }
 
-  if (ip->addrs[NDIRECT])
-  {
-    bp = bread(ip->dev, ip->addrs[NDIRECT]);
-    a = (uint*)bp->data;
-    for (j = 0; j < NINDIRECT; j++)
-    {
-      if (a[j])
-        bfree(ip->dev, a[j]);
-    }
-    brelse(bp);
-    bfree(ip->dev, ip->addrs[NDIRECT]);
-    ip->addrs[NDIRECT] = 0;
+  inode_node->din.size = 0;
+  for (int i=0; i <= NDIRECT; i++){
+    inode_node->din.addrs[i] = 0;
   }
+  inode_node->isdirty = 1;
 
-  ip->size = 0;
-  iupdate(ip);
+  inode_node_release(inode_node);
 }
 
 // Copy stat information from inode.
@@ -1069,7 +937,6 @@ void stati(struct inode* ip, struct stat* st)
 int readi(struct inode* ip, int user_dst, uint64 dst, uint off, uint n)
 {
   uint tot, m;
-  struct buf* bp;
 
   if (off > ip->size || off + n < off)
     return 0;
@@ -1105,31 +972,88 @@ int readi(struct inode* ip, int user_dst, uint64 dst, uint off, uint n)
 int writei(struct inode* ip, int user_src, uint64 src, uint off, uint n)
 {
   uint tot, m;
-  struct buf* bp;
 
   if (off > ip->size || off + n < off)
     return -1;
   if (off + n > MAXFILE * BSIZE)
     return -1;
 
+  
   for (tot = 0; tot < n; tot += m, off += m, src += m)
   {
     int fbn = off/BSIZE;
+    int data_node_created = 0;
+    int indirect_node_created = 0;
+
     struct data_cache_node* data_node = data_get(ip->dev, ip->inum, fbn);
-    if (data_node == 0)
-      break;
+
+    if (data_node == 0){
+      data_node = data_cache_get_or_create(ip->inum, fbn);
+      if (data_node == 0){
+        break;
+      }
+
+      data_node_created = 1;
+      if (fbn < NDIRECT){
+        struct inode_cache_node* inode_node = inode_get(ip->dev, ip->inum);
+        inode_node->din.addrs[fbn] = 0xFFFFFFFF;
+        inode_node_release(inode_node);
+      }else{
+        struct indirect_cache_node* indirect_node = indirect_get(ip->dev, ip->inum);
+        if (indirect_node == 0){
+          indirect_node = indirect_cache_get_or_create(ip->inum);
+          indirect_node_created = 1;
+
+          struct inode_cache_node* inode_node2 = inode_get(ip->dev, ip->inum);
+          inode_node2->din.addrs[NDIRECT] = 0xFFFFFFFF;
+          inode_node_release(inode_node2);
+        }
+        indirect_node->addrs[fbn-NDIRECT] = 0xFFFFFFFF;
+        indirect_node_release(indirect_node);
+      }
+
+    }
 
     m = min(n - tot, BSIZE - off % BSIZE);
     if (either_copyin(data_node->data + (off % BSIZE), user_src, src, m) == -1)
     {
       data_node_release(data_node);
+
+      if (data_node_created){
+        if (fbn < NDIRECT){
+          struct inode_cache_node* inode_node = inode_get(ip->dev, ip->inum);
+          inode_node->din.addrs[fbn] = 0;
+          inode_node_release(inode_node);
+        }else{
+          struct indirect_cache_node* indirect_node = indirect_get(ip->dev, ip->inum);
+          indirect_node->addrs[fbn-NDIRECT] = 0;
+          indirect_node_release(indirect_node);
+          
+          if (indirect_node_created){
+            struct inode_cache_node* inode_node2 = inode_get(ip->dev, ip->inum);
+            inode_node2->din.addrs[NDIRECT] = 0;
+            inode_node_release(inode_node2);
+            struct indirect_cache_node* indirect_orphan = indirect_cache_pop(ip->inum);
+            kfree(indirect_orphan);
+          }
+        }
+
+        struct data_cache_node* data_orphan = data_cache_pop(ip->inum, fbn);
+        kfree(data_orphan);
+      }
       break;
     }
+    data_node->isdirty = 1;
     data_node_release(data_node);
   }
 
-  if (off > ip->size)
+  
+  if (off > ip->size){
+    struct inode_cache_node* inode_node = inode_get(ip->dev, ip->inum);
     ip->size = off;
+    inode_node->din.size = off;
+    inode_node_release(inode_node);
+  }
 
   maybe_flush_dirty();
 
