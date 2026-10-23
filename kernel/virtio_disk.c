@@ -294,11 +294,11 @@ virtio_disk_rw(struct buf *b, int write)
   release(&disk.vdisk_lock);
 }
 
-void virtio_disk_seg_w(struct segbuf *sb, int blocksCount, uint64 sectorAddr){
+void virtio_disk_seg_w(struct segbuf *sb, int blocksCount, int startIdx, uint64 blockAddr){
 
   acquire(&disk.vdisk_lock);
 
-  int descIdx = -1; 
+  int descIdx = -1;
 
   while (1){
     if ((descIdx = alloc_desc()) >= 0){
@@ -312,10 +312,10 @@ void virtio_disk_seg_w(struct segbuf *sb, int blocksCount, uint64 sectorAddr){
   disk.desc[descIdx].len = (blocksCount + 2) * sizeof(struct virtq_desc) ; // desc for blocks and header and status
 
   struct virtio_blk_req *buf0 = &disk.ops[descIdx];
-  
+
   buf0->type = VIRTIO_BLK_T_OUT;
   buf0->reserved = 0;
-  buf0->sector = sectorAddr;
+  buf0->sector = blockAddr * (BSIZE / 512);
 
   disk.indirect_table[0].addr = (uint64) buf0;
   disk.indirect_table[0].len = sizeof(struct virtio_blk_req);
@@ -323,7 +323,7 @@ void virtio_disk_seg_w(struct segbuf *sb, int blocksCount, uint64 sectorAddr){
   disk.indirect_table[0].next = 1;
 
   for (int i=1; i <= blocksCount; i++){
-    disk.indirect_table[i].addr = sb->addrs[i-1];
+    disk.indirect_table[i].addr = sb->addrs[startIdx + i - 1];
     disk.indirect_table[i].len = BSIZE;
     disk.indirect_table[i].flags = VRING_DESC_F_NEXT;
     disk.indirect_table[i-1].next = i;
@@ -385,8 +385,11 @@ virtio_disk_intr()
     __sync_synchronize();
     int id = disk.used->ring[disk.used_idx % NUM].id;
 
-    if(disk.info[id].status != 0)
+    if(disk.info[id].status != 0){
+      printf("virtio_disk_intr: id=%d status=%d type=%d sector=%ld\n",
+             id, disk.info[id].status, disk.ops[id].type, disk.ops[id].sector);
       panic("virtio_disk_intr status");
+    }
 
     struct buf *b = disk.info[id].b;
     struct segbuf *sb = disk.info[id].sb;

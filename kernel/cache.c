@@ -135,8 +135,10 @@ struct data_cache_node* data_cache_get_or_create(uint inum, uint fbn)
 
   // not found: allocate, zero, link in, hand back
   n = kalloc();
-  if(n == 0)
-    panic("data_cache_get_or_create: out of memory");
+  if(n == 0){
+    release(&cache.data.lock);
+    return 0;
+  }
 
   memset(n, 0, sizeof(*n));
   n->inum = inum;
@@ -174,8 +176,10 @@ struct data_cache_node* data_cache_add(uint inum, uint fbn, char *data)
   }
 
   n = kalloc();
-  if(n == 0)
-    panic("data_cache_add: out of memory");
+  if(n == 0){
+    release(&cache.data.lock);
+    return 0;
+  }
 
   memset(n, 0, sizeof(*n));
   n->inum = inum;
@@ -206,6 +210,11 @@ struct data_cache_node* data_cache_pop(uint inum, uint fbn)
       cache.data.count--;
       release(&cache.data.lock);
       cur->refcnt++;
+      if(cur->isdirty){
+        acquire(&cache.dirtyCountLock);
+        cache.dirtyCount--;
+        release(&cache.dirtyCountLock);
+      }
       return cur;
     }
     prev = cur;
@@ -231,6 +240,22 @@ void data_node_mark_clean(struct data_cache_node *node){
   node->isdirty = 0;
   acquire(&cache.dirtyCountLock);
   cache.dirtyCount--;
+  release(&cache.dirtyCountLock);
+}
+
+// sets isdirty and increments the combined dirty count together -- the
+// mirror image of data_node_mark_clean(), for an already-cached node
+// (e.g. one fetched read-only via data_get()) that's now being modified
+// in place. A no-op if the node is already dirty, so repeated calls
+// (or a node that was created dirty in the first place) can't
+// double-count it.
+void data_node_mark_dirty(struct data_cache_node *node){
+  if (node->isdirty){
+    return;
+  }
+  node->isdirty = 1;
+  acquire(&cache.dirtyCountLock);
+  cache.dirtyCount++;
   release(&cache.dirtyCountLock);
 }
 
@@ -340,8 +365,10 @@ struct indirect_cache_node* indirect_cache_get_or_create(uint inum)
   }
 
   n = kalloc();
-  if(n == 0)
-    panic("indirect_cache_get_or_create: out of memory");
+  if(n == 0){
+    release(&cache.indirect.lock);
+    return 0;
+  }
 
   memset(n, 0, sizeof(*n));
   n->inum = inum;
@@ -375,8 +402,10 @@ struct indirect_cache_node* indirect_cache_add(uint inum, uint *addrs)
   }
 
   n = kalloc();
-  if(n == 0)
-    panic("indirect_cache_add: out of memory");
+  if(n == 0){
+    release(&cache.indirect.lock);
+    return 0;
+  }
 
   memset(n, 0, sizeof(*n));
   n->inum = inum;
@@ -408,6 +437,11 @@ struct indirect_cache_node* indirect_cache_pop(uint inum)
       cache.indirect.count--;
       release(&cache.indirect.lock);
       cur->refcnt++;
+      if(cur->isdirty){
+        acquire(&cache.dirtyCountLock);
+        cache.dirtyCount--;
+        release(&cache.dirtyCountLock);
+      }
       return cur;
     }
     prev = cur;
@@ -430,6 +464,17 @@ void indirect_node_mark_clean(struct indirect_cache_node *node){
   node->isdirty = 0;
   acquire(&cache.dirtyCountLock);
   cache.dirtyCount--;
+  release(&cache.dirtyCountLock);
+}
+
+// see data_node_mark_dirty -- same reasoning.
+void indirect_node_mark_dirty(struct indirect_cache_node *node){
+  if (node->isdirty){
+    return;
+  }
+  node->isdirty = 1;
+  acquire(&cache.dirtyCountLock);
+  cache.dirtyCount++;
   release(&cache.dirtyCountLock);
 }
 
@@ -528,8 +573,10 @@ struct inode_cache_node* inode_cache_get_or_create(uint inum)
   }
 
   n = kalloc();
-  if(n == 0)
-    panic("inode_cache_get_or_create: out of memory");
+  if(n == 0){
+    release(&cache.inode.lock);
+    return 0;
+  }
 
   memset(n, 0, sizeof(*n));
   n->inum = inum;
@@ -563,8 +610,10 @@ struct inode_cache_node* inode_cache_add(uint inum, struct dinode *din)
   }
 
   n = kalloc();
-  if(n == 0)
-    panic("inode_cache_add: out of memory");
+  if(n == 0){
+    release(&cache.inode.lock);
+    return 0;
+  }
 
   memset(n, 0, sizeof(*n));
   n->inum = inum;
@@ -595,6 +644,11 @@ struct inode_cache_node* inode_cache_pop(uint inum)
       cache.inode.count--;
       release(&cache.inode.lock);
       cur->refcnt++;
+      if(cur->isdirty){
+        acquire(&cache.dirtyCountLock);
+        cache.dirtyCount--;
+        release(&cache.dirtyCountLock);
+      }
       return cur;
     }
     prev = cur;
@@ -617,6 +671,17 @@ void inode_node_mark_clean(struct inode_cache_node *node){
   node->isdirty = 0;
   acquire(&cache.dirtyCountLock);
   cache.dirtyCount--;
+  release(&cache.dirtyCountLock);
+}
+
+// see data_node_mark_dirty -- same reasoning.
+void inode_node_mark_dirty(struct inode_cache_node *node){
+  if (node->isdirty){
+    return;
+  }
+  node->isdirty = 1;
+  acquire(&cache.dirtyCountLock);
+  cache.dirtyCount++;
   release(&cache.dirtyCountLock);
 }
 
@@ -715,8 +780,10 @@ struct imap_cache_node* imap_cache_get_or_create(uint idx)
   }
 
   n = kalloc();
-  if(n == 0)
-    panic("imap_cache_get_or_create: out of memory");
+  if(n == 0){
+    release(&cache.imap.lock);
+    return 0;
+  }
 
   memset(n, 0, sizeof(*n));
   n->idx = idx;
@@ -750,8 +817,10 @@ struct imap_cache_node* imap_cache_add(uint idx, uint *addrs)
   }
 
   n = kalloc();
-  if(n == 0)
-    panic("imap_cache_add: out of memory");
+  if(n == 0){
+    release(&cache.imap.lock);
+    return 0;
+  }
 
   memset(n, 0, sizeof(*n));
   n->idx = idx;
@@ -782,6 +851,11 @@ struct imap_cache_node* imap_cache_pop(uint idx)
       cache.imap.count--;
       release(&cache.imap.lock);
       cur->refcnt++;
+      if(cur->isdirty){
+        acquire(&cache.dirtyCountLock);
+        cache.dirtyCount--;
+        release(&cache.dirtyCountLock);
+      }
       return cur;
     }
     prev = cur;
@@ -804,6 +878,17 @@ void imap_node_mark_clean(struct imap_cache_node *node){
   node->isdirty = 0;
   acquire(&cache.dirtyCountLock);
   cache.dirtyCount--;
+  release(&cache.dirtyCountLock);
+}
+
+// see data_node_mark_dirty -- same reasoning.
+void imap_node_mark_dirty(struct imap_cache_node *node){
+  if (node->isdirty){
+    return;
+  }
+  node->isdirty = 1;
+  acquire(&cache.dirtyCountLock);
+  cache.dirtyCount++;
   release(&cache.dirtyCountLock);
 }
 
@@ -902,8 +987,10 @@ struct segsum_cache_node* segsum_cache_get_or_create(uint segnum, uint groupidx)
   }
 
   n = kalloc();
-  if(n == 0)
-    panic("segsum_cache_get_or_create: out of memory");
+  if(n == 0){
+    release(&cache.segsum.lock);
+    return 0;
+  }
 
   memset(n, 0, sizeof(*n));
   n->segnum = segnum;
@@ -933,8 +1020,10 @@ struct segsum_cache_node* segsum_cache_add(uint segnum, uint groupidx, struct se
   }
 
   n = kalloc();
-  if(n == 0)
-    panic("segsum_cache_add: out of memory");
+  if(n == 0){
+    release(&cache.segsum.lock);
+    return 0;
+  }
 
   memset(n, 0, sizeof(*n));
   n->segnum = segnum;

@@ -241,7 +241,34 @@ main(int argc, char *argv[])
   off = ((off/BSIZE) + 1) * BSIZE;
   root_inode_node->din.size = xint(off);
 
-  
+  // flush the root directory's own data (and indirect, if it ever grows
+  // past NDIRECT blocks) the same way every other file's are flushed just above 
+  struct indirect_cache_node *root_indirect_node = indirect_cache_pop(rootino);
+
+  for (int fbn = 0; fbn < MAXFILE; fbn++){
+    struct data_cache_node* data_node = data_cache_pop(rootino, fbn);
+
+    if (data_node == NULL){
+      break;
+    }
+
+    uint data_diskaddr = seg_write_block(rootino, fbn+1, data_node->data);
+    free(data_node);
+
+    if (fbn < NDIRECT){
+      root_inode_node->din.addrs[fbn] = xint(data_diskaddr);
+    }else{
+      root_indirect_node->addrs[fbn - NDIRECT] = xint(data_diskaddr);
+    }
+  }
+
+  if (root_indirect_node != NULL){
+    uint root_indirect_diskaddr = seg_write_block(rootino, 0xFFFFFFFF, root_indirect_node->addrs);
+    free(root_indirect_node);
+
+    root_inode_node->din.addrs[NDIRECT] = xint(root_indirect_diskaddr);
+  }
+
   struct imap_cache_node *imap_node = imap_cache_lookup(IMAP_BLK_IDX(rootino));
   uint root_inode_diskaddr = seg_write_block(rootino, 0, &root_inode_node->din);
   imap_node->addrs[IMAP_OFFSET(rootino)] = xint(root_inode_diskaddr);
@@ -262,6 +289,7 @@ main(int argc, char *argv[])
 
   seg_flush_group();  // flush whatever's left in the in-progress group
 
+  cp.next_inode = xint(freeinode);
   cp.timestamp = xint(++cp_counter);
 
   checkpoint_flush(xint(sb.checkpoint1start), &cp);

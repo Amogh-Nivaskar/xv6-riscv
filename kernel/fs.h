@@ -107,6 +107,7 @@ struct checkpoint {
   struct sut_entry sut[SEG_NUM];
   uchar seg_freemap[SEG_FREEMAP_BYTES];
   uint global_seq;
+  uint next_inode;   // next never-before-used inode number to hand out
   uint timestamp;
 };
 

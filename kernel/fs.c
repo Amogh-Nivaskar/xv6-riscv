@@ -45,6 +45,9 @@ uint freeinode;
 
 void checkpointinit(int dev, struct lfs_superblock *sb, struct checkpoint *cp);
 static struct inode* iget(uint dev, uint inum);
+struct inode_cache_node* inode_get(uint dev, uint inum);
+struct indirect_cache_node *indirect_get(uint dev, uint inum);
+struct imap_cache_node* imap_get(uint dev, uint idx);
 
 // Read the super block.
 static void
@@ -101,6 +104,8 @@ void checkpointinit(int dev, struct lfs_superblock *sb, struct checkpoint *cp){
   }else{
     memmove(cp, cp2, sizeof(struct checkpoint));
   }
+
+  freeinode = cp->next_inode;
 
   kfree(cp1);
   kfree(cp2);
@@ -192,7 +197,7 @@ void move_group_to_segbuf(int segOffset, int blocks){
     }
 
     targetAddr = pageAddr + (pageOffset * BSIZE);
-    memmove((void*) targetAddr, group_data[segOffset-startOffset], BSIZE);
+    memmove((void*) targetAddr, group_data[segOffset-startOffset-1], BSIZE);
 
     seg.addrs[pageBase + pageOffset] = targetAddr;
 
@@ -214,6 +219,11 @@ int build_group(int offset)
     sumblk.entries[i].tag2 = 0;
   }
 
+  acquire(&cpLock);
+  uint segNum = cp.segment_num;
+  release(&cpLock);
+  uint groupBase = segment_start_block(segNum) + offset + 1;
+
   int idx = 0; // index in the group list
 
   while (idx < group_capacity(offset)){
@@ -227,8 +237,32 @@ int build_group(int offset)
 
     sumblk.entries[idx].tag1 = data_node->inum;
     sumblk.entries[idx].tag2 = data_node->fbn+1;
+
+    uint realAddr = groupBase + idx;
+    uint dnum = data_node->inum;
+    uint dfbn = data_node->fbn;
+
     data_node_mark_clean(data_node);
     data_node_release(data_node);
+
+    if (dfbn < NDIRECT){
+      struct inode_cache_node *owner = inode_get(ROOTDEV, dnum);
+      if (owner == 0){
+        panic("build_group: data owner inode not found");
+      }
+      owner->din.addrs[dfbn] = realAddr;
+      inode_node_mark_dirty(owner);
+      inode_node_release(owner);
+    }else{
+      struct indirect_cache_node *owner = indirect_get(ROOTDEV, dnum);
+      if (owner == 0){
+        panic("build_group: data owner indirect not found");
+      }
+      owner->addrs[dfbn - NDIRECT] = realAddr;
+      indirect_node_mark_dirty(owner);
+      indirect_node_release(owner);
+    }
+
     idx += 1;
   }
 
@@ -244,8 +278,21 @@ int build_group(int offset)
 
     sumblk.entries[idx].tag1 = indirect_node->inum;
     sumblk.entries[idx].tag2 = 0xFFFFFFFF;
+
+    uint realAddr = groupBase + idx;
+    uint inum = indirect_node->inum;
+
     indirect_node_mark_clean(indirect_node);
     indirect_node_release(indirect_node);
+
+    struct inode_cache_node *owner = inode_get(ROOTDEV, inum);
+    if (owner == 0){
+      panic("build_group: indirect owner inode not found");
+    }
+    owner->din.addrs[NDIRECT] = realAddr;
+    inode_node_mark_dirty(owner);
+    inode_node_release(owner);
+
     idx += 1;
   }
 
@@ -261,8 +308,21 @@ int build_group(int offset)
 
     sumblk.entries[idx].tag1 = inode_node->inum;
     sumblk.entries[idx].tag2 = 0;
+
+    uint realAddr = groupBase + idx;
+    uint inum = inode_node->inum;
+
     inode_node_mark_clean(inode_node);
     inode_node_release(inode_node);
+
+    struct imap_cache_node *owner = imap_get(ROOTDEV, IMAP_BLK_IDX(inum));
+    if (owner == 0){
+      panic("build_group: inode owner imap block not found");
+    }
+    owner->addrs[IMAP_OFFSET(inum)] = realAddr;
+    imap_node_mark_dirty(owner);
+    imap_node_release(owner);
+
     idx += 1;
   }
 
@@ -278,8 +338,17 @@ int build_group(int offset)
 
     sumblk.entries[idx].tag1 = 0;
     sumblk.entries[idx].tag2 = imap_node->idx+1;
+
+    uint realAddr = groupBase + idx;
+    uint imapIdx = imap_node->idx;
+
     imap_node_mark_clean(imap_node);
     imap_node_release(imap_node);
+
+    acquire(&cpLock);
+    cp.imap_addr[imapIdx] = realAddr;
+    release(&cpLock);
+
     idx += 1;
   }
 
@@ -405,7 +474,7 @@ void maybe_flush_dirty()
 
   while (cache_dirty_count() > 0){
 
-    if (offset == SSIZE){
+    if (group_capacity(offset) == 0){
       int s = next_free_segment();
       acquire(&cpLock);
       cp.fill_offset = 0;
@@ -421,6 +490,8 @@ void maybe_flush_dirty()
       releasesleep(&seg.lock);
     }
 
+    int startOffset = offset;
+
     while (offset < SSIZE){
       int idx = build_group(offset);
 
@@ -433,7 +504,8 @@ void maybe_flush_dirty()
       offset += idx + 1;
     }
 
-    virtio_disk_seg_w(&seg, offset - cp.fill_offset, cp.fill_offset);
+    virtio_disk_seg_w(&seg, offset - startOffset, startOffset,
+                       segment_start_block(cp.segment_num) + startOffset);
   }
 
 
@@ -459,13 +531,24 @@ inode_alloc(ushort type)
   }
 
   struct inode_cache_node *inode_node = inode_cache_get_or_create(inum);
+  if (inode_node == 0){
+    return 0;
+  }
 
   inode_node->din.type = type;
   inode_node->din.nlink = 1;
   inode_node->din.size = 0;
 
-  struct imap_cache_node *imap_node = imap_cache_get_or_create(IMAP_BLK_IDX(inum));
+  struct imap_cache_node *imap_node = imap_get(ROOTDEV, IMAP_BLK_IDX(inum));
+  if (imap_node == 0){
+    imap_node = imap_cache_get_or_create(IMAP_BLK_IDX(inum));
+    if (imap_node == 0){
+      inode_node_release(inode_node);
+      return 0;
+    }
+  }
   imap_node->addrs[IMAP_OFFSET(inum)] = 0xFFFFFFFF;
+  imap_node_mark_dirty(imap_node);
   imap_node_release(imap_node);
 
   inode_node_release(inode_node);
@@ -480,6 +563,9 @@ inode_alloc(ushort type)
 struct inode* ialloc(uint dev, short type)
 {
   uint inum = inode_alloc(type);
+  if (inum == 0){
+    return 0;
+  }
   return iget(dev, inum);
 }
 
@@ -755,7 +841,7 @@ void iupdate(struct inode* ip)
   inode_node->din.nlink = ip->nlink;
   inode_node->din.size = ip->size;
   memmove(inode_node->din.addrs, ip->addrs, sizeof(ip->addrs));
-  inode_node->isdirty = 1;
+  inode_node_mark_dirty(inode_node);
 
   inode_node_release(inode_node);
 }
@@ -874,7 +960,7 @@ void iput(struct inode* ip)
     ip->type = 0;
     struct inode_cache_node* inode_node = inode_get(ip->dev, ip->inum);
     inode_node->din.type = 0;
-    inode_node->isdirty = 1;
+    inode_node_mark_dirty(inode_node);
     inode_node_release(inode_node);
     
     releasesleep(&ip->lock);
@@ -914,9 +1000,10 @@ void itrunc(struct inode* ip)
   for (int i=0; i <= NDIRECT; i++){
     inode_node->din.addrs[i] = 0;
   }
-  inode_node->isdirty = 1;
+  inode_node_mark_dirty(inode_node);
 
   inode_node_release(inode_node);
+  ip->size = 0;
 }
 
 // Copy stat information from inode.
@@ -996,15 +1083,36 @@ int writei(struct inode* ip, int user_src, uint64 src, uint off, uint n)
       data_node_created = 1;
       if (fbn < NDIRECT){
         struct inode_cache_node* inode_node = inode_get(ip->dev, ip->inum);
+        if (inode_node == 0){
+          data_node_release(data_node);
+          struct data_cache_node* orphan = data_cache_pop(ip->inum, fbn);
+          kfree(orphan);
+          break;
+        }
         inode_node->din.addrs[fbn] = 0xFFFFFFFF;
         inode_node_release(inode_node);
       }else{
         struct indirect_cache_node* indirect_node = indirect_get(ip->dev, ip->inum);
         if (indirect_node == 0){
           indirect_node = indirect_cache_get_or_create(ip->inum);
+          if (indirect_node == 0){
+            data_node_release(data_node);
+            struct data_cache_node* orphan = data_cache_pop(ip->inum, fbn);
+            kfree(orphan);
+            break;
+          }
           indirect_node_created = 1;
 
           struct inode_cache_node* inode_node2 = inode_get(ip->dev, ip->inum);
+          if (inode_node2 == 0){
+            indirect_node_release(indirect_node);
+            struct indirect_cache_node* indirect_orphan = indirect_cache_pop(ip->inum);
+            kfree(indirect_orphan);
+            data_node_release(data_node);
+            struct data_cache_node* orphan = data_cache_pop(ip->inum, fbn);
+            kfree(orphan);
+            break;
+          }
           inode_node2->din.addrs[NDIRECT] = 0xFFFFFFFF;
           inode_node_release(inode_node2);
         }
@@ -1043,16 +1151,19 @@ int writei(struct inode* ip, int user_src, uint64 src, uint off, uint n)
       }
       break;
     }
-    data_node->isdirty = 1;
+    data_node_mark_dirty(data_node);
     data_node_release(data_node);
   }
 
   
   if (off > ip->size){
     struct inode_cache_node* inode_node = inode_get(ip->dev, ip->inum);
-    ip->size = off;
-    inode_node->din.size = off;
-    inode_node_release(inode_node);
+    if (inode_node != 0){
+      ip->size = off;
+      inode_node->din.size = off;
+      inode_node_mark_dirty(inode_node);
+      inode_node_release(inode_node);
+    }
   }
 
   maybe_flush_dirty();
