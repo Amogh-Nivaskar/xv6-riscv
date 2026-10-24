@@ -48,6 +48,7 @@ static struct inode* iget(uint dev, uint inum);
 struct inode_cache_node* inode_get(uint dev, uint inum);
 struct indirect_cache_node *indirect_get(uint dev, uint inum);
 struct imap_cache_node* imap_get(uint dev, uint idx);
+struct data_cache_node *data_get(uint dev, uint inum, uint fbn);
 
 // Read the super block.
 static void
@@ -112,7 +113,6 @@ void checkpointinit(int dev, struct lfs_superblock *sb, struct checkpoint *cp){
   initlock(&cpLock, "cpLock");
 }
 
-
 // SEGMENT WRITER
 
 uint checksum(void *data, int nbytes)
@@ -130,12 +130,86 @@ uint segment_start_block(uint segnum)
   return nmeta + segnum * SSIZE;
 }
 
+uint segment_of_block(uint blockAddr)
+{
+  return (blockAddr - nmeta) / SSIZE;
+}
+
+// Records that a block's owner now points somewhere new: the segment it
+// used to live in (if any) loses one live block, the segment it was just
+// written into gains one. oldAddr of 0 (never allocated) or 0xFFFFFFFF
+// (still awaiting its first-ever flush) means there's no real previous
+// segment to charge -- this is the block's first real placement.
+void sut_update(uint oldAddr, uint newSegNum)
+{
+  acquire(&cpLock);
+  if (oldAddr != 0 && oldAddr != 0xFFFFFFFF){
+    cp.sut[segment_of_block(oldAddr)].live_count--;
+  }
+  cp.sut[newSegNum].live_count++;
+  cp.sut[newSegNum].last_mod_time = cp.global_seq;
+  release(&cpLock);
+}
+
 void free_segment(uint segNo){
-  cp.seg_freemap[segNo/8] &= (1 << (segNo%8));
+  cp.seg_freemap[segNo/8] |= (1 << (segNo%8));
 }
 
 void claim_segment(uint segNo){
   cp.seg_freemap[segNo/8] &= ~(1 << (segNo%8));
+}
+
+uint free_segment_count(void)
+{
+  uint n = 0;
+  acquire(&cpLock);
+  for(uint s = 0; s < SEG_NUM; s++){
+    if(cp.seg_freemap[s/8] & (1 << (s%8))){
+      n++;
+    }
+  }
+  release(&cpLock);
+  return n;
+}
+
+// Picks the claimed, non-active segment with the best cost/benefit score
+// to reclaim: score = age*(1-u)/(1+u), rewritten with u = live/SSIZE to
+// avoid floating point: age*(SSIZE-live)/(SSIZE+live). Higher is better
+// -- old segments that are mostly dead are the cheapest to clean and
+// free the most space. Returns -1 if nothing is worth cleaning (every
+// claimed segment is either fully live or there simply are none).
+int select_segment_to_clean(void)
+{
+  acquire(&cpLock);
+  uint activeSeg = cp.segment_num;
+  uint curTime = cp.global_seq;
+  int best = -1;
+  uint bestScore = 0;
+
+  for(uint s = 0; s < SEG_NUM; s++){
+    if(cp.seg_freemap[s/8] & (1 << (s%8))){
+      continue;  // free, nothing to clean
+    }
+    if(s == activeSeg){
+      continue;  // still being filled, not a cleaning candidate
+    }
+
+    uint live = cp.sut[s].live_count;
+    if(live >= SSIZE){
+      continue;  // fully live, nothing to gain
+    }
+
+    uint age = curTime - cp.sut[s].last_mod_time;
+    uint score = age * (SSIZE - live) / (SSIZE + live);
+
+    if(best == -1 || score > bestScore){
+      best = (int) s;
+      bestScore = score;
+    }
+  }
+
+  release(&cpLock);
+  return best;
 }
 
 uint next_free_segment(void)
@@ -148,6 +222,132 @@ uint next_free_segment(void)
   }
   panic("next_free_segment: no free segments");
   return 0;  // unreachable
+}
+
+// Scans a to be cleaned segment's groups and marks every block that's still
+// live (its owner still points at this exact position) dirty, so that
+// the next flush picks it up and rewrites it elsewhere.
+// Blocks that are already dead are left alone as they are orphaned
+// with nothing pointing to them and the disk content is about to be
+// reclaimed as free space after the segment is cleaned and can be reused.
+void clean_segment(uint segnum)
+{
+  uint base = segment_start_block(segnum);
+  uint pos = 0;
+
+  uint foundLive = 0;
+
+  while (pos < SSIZE){
+    struct buf *b = bread(ROOTDEV, base + pos);
+    struct segsum_block *ssb = (struct segsum_block*) b->data;
+
+    if (checksum(ssb, sizeof(*ssb) - sizeof(uint)) != ssb->self_checksum){
+      brelse(b);
+      break;  // not a real group -- the segment's unused trailing slot
+    }
+
+    int count = 0;
+    while (count < NDATA_PER_SEGSUM - 1 &&
+           !(ssb->entries[count].tag1 == 0 && ssb->entries[count].tag2 == 0)){
+      count++;
+    }
+
+    for (int i = 0; i < count; i++){
+      uint tag1 = ssb->entries[i].tag1;
+      uint tag2 = ssb->entries[i].tag2;
+      uint blockPos = base + pos + 1 + i;
+
+      if (tag1 == 0){
+        // imap block, idx = tag2-1
+        uint idx = tag2 - 1;
+        acquire(&cpLock);
+        uint cur = cp.imap_addr[idx];
+        release(&cpLock);
+        if (cur == blockPos){
+          struct imap_cache_node *n = imap_get(ROOTDEV, idx);
+          if (n != 0){
+            imap_node_mark_dirty(n);
+            imap_node_release(n);
+            foundLive++;
+          }
+        }
+      }else if (tag2 == 0){
+        // inode block, inum = tag1
+        uint inum = tag1;
+        struct imap_cache_node *imapblk = imap_get(ROOTDEV, IMAP_BLK_IDX(inum));
+        if (imapblk != 0){
+          uint cur = imapblk->addrs[IMAP_OFFSET(inum)];
+          imap_node_release(imapblk);
+          if (cur == blockPos){
+            struct inode_cache_node *n = inode_get(ROOTDEV, inum);
+            if (n != 0){
+              inode_node_mark_dirty(n);
+              inode_node_release(n);
+              foundLive++;
+            }
+          }
+        }
+      }else if (tag2 == 0xFFFFFFFF){
+        // indirect block, inum = tag1
+        uint inum = tag1;
+        struct inode_cache_node *inodeblk = inode_get(ROOTDEV, inum);
+        if (inodeblk != 0){
+          uint cur = inodeblk->din.addrs[NDIRECT];
+          inode_node_release(inodeblk);
+          if (cur == blockPos){
+            struct indirect_cache_node *n = indirect_get(ROOTDEV, inum);
+            if (n != 0){
+              indirect_node_mark_dirty(n);
+              indirect_node_release(n);
+              foundLive++;
+            }
+          }
+        }
+      }else{
+        // data block, inum = tag1, fbn = tag2-1
+        uint inum = tag1;
+        uint fbn = tag2 - 1;
+        uint cur = 0;
+        int haveCur = 0;
+
+        if (fbn < NDIRECT){
+          struct inode_cache_node *inodeblk = inode_get(ROOTDEV, inum);
+          if (inodeblk != 0){
+            cur = inodeblk->din.addrs[fbn];
+            inode_node_release(inodeblk);
+            haveCur = 1;
+          }
+        }else{
+          struct indirect_cache_node *indblk = indirect_get(ROOTDEV, inum);
+          if (indblk != 0){
+            cur = indblk->addrs[fbn - NDIRECT];
+            indirect_node_release(indblk);
+            haveCur = 1;
+          }
+        }
+
+        if (haveCur && cur == blockPos){
+          struct data_cache_node *n = data_get(ROOTDEV, inum, fbn);
+          if (n != 0){
+            data_node_mark_dirty(n);
+            data_node_release(n);
+            foundLive++;
+          }
+        }
+      }
+    }
+
+    brelse(b);
+    pos += 1 + count;
+  }
+
+  acquire(&cpLock);
+  if (cp.sut[segnum].live_count != foundLive){
+    printf("gc: segment %d live_count was %d, correcting to %d (exhaustive scan)\n",
+           segnum, cp.sut[segnum].live_count, foundLive);
+    cp.sut[segnum].live_count = foundLive;
+  }
+  release(&cpLock);
 }
 
 // how many more real (non-summary) blocks the in-progress group could
@@ -250,7 +450,9 @@ int build_group(int offset)
       if (owner == 0){
         panic("build_group: data owner inode not found");
       }
+      uint oldAddr = owner->din.addrs[dfbn];
       owner->din.addrs[dfbn] = realAddr;
+      sut_update(oldAddr, segNum);
       inode_node_mark_dirty(owner);
       inode_node_release(owner);
     }else{
@@ -258,7 +460,9 @@ int build_group(int offset)
       if (owner == 0){
         panic("build_group: data owner indirect not found");
       }
+      uint oldAddr = owner->addrs[dfbn - NDIRECT];
       owner->addrs[dfbn - NDIRECT] = realAddr;
+      sut_update(oldAddr, segNum);
       indirect_node_mark_dirty(owner);
       indirect_node_release(owner);
     }
@@ -289,7 +493,9 @@ int build_group(int offset)
     if (owner == 0){
       panic("build_group: indirect owner inode not found");
     }
+    uint oldAddr = owner->din.addrs[NDIRECT];
     owner->din.addrs[NDIRECT] = realAddr;
+    sut_update(oldAddr, segNum);
     inode_node_mark_dirty(owner);
     inode_node_release(owner);
 
@@ -319,7 +525,9 @@ int build_group(int offset)
     if (owner == 0){
       panic("build_group: inode owner imap block not found");
     }
+    uint oldAddr = owner->addrs[IMAP_OFFSET(inum)];
     owner->addrs[IMAP_OFFSET(inum)] = realAddr;
+    sut_update(oldAddr, segNum);
     imap_node_mark_dirty(owner);
     imap_node_release(owner);
 
@@ -346,8 +554,10 @@ int build_group(int offset)
     imap_node_release(imap_node);
 
     acquire(&cpLock);
+    uint oldAddr = cp.imap_addr[imapIdx];
     cp.imap_addr[imapIdx] = realAddr;
     release(&cpLock);
+    sut_update(oldAddr, segNum);
 
     idx += 1;
   }
@@ -468,6 +678,39 @@ void maybe_flush_dirty()
 
   acquiresleep(&flushLock);
 
+  // low on free segments: pick the best cleaning candidates and mark
+  // their still-live blocks dirty now, so the flush loop below --
+  // already about to run -- sweeps them out to a new segment in this
+  // same pass. 
+  int cleaningSegnums[GC_SEGMENTS_PER_ROUND];
+  int numCleaning = 0;
+  if (free_segment_count() < GC_MIN_FREE_SEGMENTS){
+    for (int round = 0; round < GC_SEGMENTS_PER_ROUND; round++){
+      int segnum = select_segment_to_clean();
+      if (segnum < 0){
+        break;  // nothing left worth cleaning
+      }
+      int alreadyCleaning = 0;
+      for (int k = 0; k < numCleaning; k++){
+        if (cleaningSegnums[k] == segnum){
+          alreadyCleaning = 1;
+          break;
+        }
+      }
+      if (alreadyCleaning){
+        // the best remaining candidate is one we already started
+        // cleaning this round (its sut entry won't reflect the
+        // migration until the flush below actually runs) -- nothing
+        // better to do this round.
+        break;
+      }
+      printf("gc: cleaning segment %d (live=%d)\n",
+             segnum, cp.sut[segnum].live_count);
+      clean_segment((uint) segnum);
+      cleaningSegnums[numCleaning++] = segnum;
+    }
+  }
+
   acquire(&cpLock);
   int offset = cp.fill_offset;
   release(&cpLock);
@@ -484,6 +727,14 @@ void maybe_flush_dirty()
       offset = 0;
 
       acquiresleep(&seg.lock);
+      // every 4 consecutive positions share one kalloc'd page as 
+      // seg.addrs[pageBase] holds that page's raw address. 
+      // Free each page exactly once before dropping the pointers
+      for (int i=0; i<SSIZE; i+=4){
+        if (seg.addrs[i] != 0){
+          kfree((void*)seg.addrs[i]);
+        }
+      }
       for (int i=0; i<SSIZE; i++){
         seg.addrs[i] = 0;
       }
@@ -513,8 +764,24 @@ void maybe_flush_dirty()
   cp.fill_offset = offset;
   release(&cpLock);
 
+  // the loop above just drained every dirty block, including whatever
+  // clean_segment() marked dirty -- if that fully migrated a cleaned
+  // segment's live blocks elsewhere, it's safe to hand it back out now.
+  for (int k = 0; k < numCleaning; k++){
+    acquire(&cpLock);
+    uint remaining = cp.sut[cleaningSegnums[k]].live_count;
+    release(&cpLock);
+    if (remaining == 0){
+      printf("gc: segment %d fully reclaimed\n", cleaningSegnums[k]);
+      free_segment((uint) cleaningSegnums[k]);
+    }else{
+      printf("gc: segment %d still has %d live blocks, retrying later\n",
+             cleaningSegnums[k], remaining);
+    }
+  }
+
   releasesleep(&flushLock);
-  
+
   lru_cache_eviction();
 }
 
@@ -988,6 +1255,23 @@ void iunlockput(struct inode* ip)
 
 // Truncate inode (discard contents).
 // Caller must hold ip->lock.
+// Credits a freed block's old segment, if it had a real previous
+// location, and drops any still-cached copy -- mirrors sut_update()'s
+// "old side" plus a pop, since this content isn't moving to a new
+// segment, it's just gone.
+static void itrunc_release_data(uint oldAddr, uint inum, uint fbn)
+{
+  if (oldAddr != 0 && oldAddr != 0xFFFFFFFF){
+    acquire(&cpLock);
+    cp.sut[segment_of_block(oldAddr)].live_count--;
+    release(&cpLock);
+  }
+  struct data_cache_node *dn = data_cache_pop(inum, fbn);
+  if (dn != 0){
+    kfree(dn);
+  }
+}
+
 void itrunc(struct inode* ip)
 {
   struct inode_cache_node* inode_node = inode_get(ip->dev, ip->inum);
@@ -996,10 +1280,28 @@ void itrunc(struct inode* ip)
     panic("itrunc: inode not found");
   }
 
-  inode_node->din.size = 0;
-  for (int i=0; i <= NDIRECT; i++){
+  for (int i=0; i < NDIRECT; i++){
+    itrunc_release_data(inode_node->din.addrs[i], ip->inum, i);
     inode_node->din.addrs[i] = 0;
   }
+
+  uint oldIndirectAddr = inode_node->din.addrs[NDIRECT];
+  if (oldIndirectAddr != 0 && oldIndirectAddr != 0xFFFFFFFF){
+    acquire(&cpLock);
+    cp.sut[segment_of_block(oldIndirectAddr)].live_count--;
+    release(&cpLock);
+  }
+
+  struct indirect_cache_node *indirect_node = indirect_cache_pop(ip->inum);
+  if (indirect_node != 0){
+    for (int j=0; j < NINDIRECT; j++){
+      itrunc_release_data(indirect_node->addrs[j], ip->inum, NDIRECT + j);
+    }
+    kfree(indirect_node);
+  }
+  inode_node->din.addrs[NDIRECT] = 0;
+
+  inode_node->din.size = 0;
   inode_node_mark_dirty(inode_node);
 
   inode_node_release(inode_node);

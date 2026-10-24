@@ -83,6 +83,10 @@ struct segsum_block {
 #define IMAP_ENTRIES_PER_BLK (BSIZE / sizeof(uint))          // 256
 #define IMAP_BLK_NUM ((NINODES + IMAP_ENTRIES_PER_BLK - 1) / IMAP_ENTRIES_PER_BLK)  // 253
 #define SEG_NUM 100
+#define GC_MIN_FREE_SEGMENTS 10  // trigger the cleaner once free segments drop below this
+#define GC_SEGMENTS_PER_ROUND 5  // clean this many per triggered round, not just one --
+                                  // otherwise a round's own ambient writes claim back
+                                  // roughly what it just freed, net zero progress
 
 struct sut_entry {
   uint live_count;
