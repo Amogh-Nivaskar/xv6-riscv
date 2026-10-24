@@ -157,6 +157,49 @@ def recover_orphan():
     q.match('^ireclaim')
     q.stop()
 
+def crash_checkpoint():
+    q = QEMU(True)
+    q.cmd("echo before-crash-content > ckpttest\n")
+    time.sleep(1)
+    q.read()
+    # let enough real time pass for both the flush interval (NFLUSHTICKS,
+    # ~5s) and the checkpoint interval (CHECKPOINT_INTERVAL_TICKS, ~30s)
+    # to elapse since boot, so the next write's own maybe_flush_dirty()
+    # call actually drains the pending data and persists a checkpoint.
+    time.sleep(35)
+    q.cmd("echo trigger-flush > trigger\n")
+    time.sleep(2)
+    q.read()
+    q.crash()
+    q.stop()
+
+def recover_checkpoint():
+    q = QEMU()
+    time.sleep(2)
+    q.read()
+    ok_boot = 'panic' not in q.output
+    q.cmd("cat ckpttest\n")
+    time.sleep(1)
+    q.cmd("echo after-crash-content > newfile\n")
+    time.sleep(1)
+    q.cmd("cat newfile\n")
+    time.sleep(1)
+    q.read()
+    ok_old, _ = q.match('before-crash-content', exit=False)
+    ok_new, _ = q.match('after-crash-content', exit=False)
+    q.stop()
+    return ok_boot, ok_old, ok_new
+
+def test_checkpoint():
+    print("Test checkpoint persistence survives a hard crash")
+    crash_checkpoint()
+    ok_boot, ok_old, ok_new = recover_checkpoint()
+    if ok_boot and ok_old and ok_new:
+        print("OK")
+    else:
+        print(f"FAIL (boot ok={ok_boot} old file survived={ok_old} new file after reboot={ok_new})")
+        sys.exit(1)
+
 def test_log():
     print("Test recovery of log")
     for i in range(5):
@@ -185,6 +228,7 @@ def test_crash():
     test_log()
     test_forphan()
     test_dorphan()
+    test_checkpoint()
 
 def test_usertests(test=""):
     timeout = 600

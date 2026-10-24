@@ -34,10 +34,12 @@ char group_data[GROUP_CAP][BSIZE];
 int group_n;                      // blocks buffered in the current, unflushed group
 
 int cp_counter;
+int cp_last_region;  // 0 = checkpoint1 is current, 1 = checkpoint2 is current
 struct spinlock cpLock;
 struct sleeplock flushLock;
 
 uint lastFlushTicks;
+uint lastCheckpointTicks;
 
 int nmeta;
 int nblocks;
@@ -92,26 +94,63 @@ void checkpointinit(int dev, struct lfs_superblock *sb, struct checkpoint *cp){
   for (int i=0; i < sb->checkpointsize; i++){
     b = bread(dev, sb->checkpoint1start + i);
     memmove(p + (i*BSIZE), b->data, BSIZE);
+    brelse(b);
   }
 
   p = (char*) cp2;
   for (int i=0; i < sb->checkpointsize; i++){
     b = bread(dev, sb->checkpoint2start + i);
     memmove(p + (i*BSIZE), b->data, BSIZE);
+    brelse(b);
   }
 
   if (cp1->timestamp > cp2->timestamp){
     memmove(cp, cp1, sizeof(struct checkpoint));
+    cp_last_region = 0;  // checkpoint1 is current; next flush targets checkpoint2
   }else{
     memmove(cp, cp2, sizeof(struct checkpoint));
+    cp_last_region = 1;  // checkpoint2 is current; next flush targets checkpoint1
   }
 
   freeinode = cp->next_inode;
+  cp_counter = (int) cp->timestamp;
 
   kfree(cp1);
   kfree(cp2);
   initlock(&cpLock, "cpLock");
 }
+
+// Persists the in-memory checkpoint to whichever of CR0/CR1 was NOT
+// most recently written, stamped with a new timestamp -- so if a crash
+// happens mid-write, the other region still holds the last fully
+// written, consistent checkpoint. 
+void checkpoint_flush(void)
+{
+  struct checkpoint *snapshot = kalloc();
+  if (snapshot == 0){
+    return;  // best-effort; skip this persist rather than block on OOM
+  }
+
+  acquire(&cpLock);
+  cp.next_inode = freeinode;
+  cp.timestamp = (uint) (++cp_counter);
+  memmove(snapshot, &cp, sizeof(cp));
+  release(&cpLock);
+
+  uint target = (cp_last_region == 0) ? sb.checkpoint2start : sb.checkpoint1start;
+  cp_last_region = 1 - cp_last_region;
+
+  char *p = (char*) snapshot;
+  for (int i = 0; i < NCHECKPOINTBLOCKS; i++){
+    struct buf *b = bread(ROOTDEV, target + i);
+    memmove(b->data, p + (i*BSIZE), BSIZE);
+    bwrite(b);
+    brelse(b);
+  }
+
+  kfree(snapshot);
+}
+
 
 // SEGMENT WRITER
 
@@ -662,55 +701,11 @@ void lru_cache_eviction(){
   
 }
 
-void maybe_flush_dirty()
+// Drains every currently dirty block to disk, claiming new segments as
+// needed. Safe to call with nothing dirty (no-op). Caller holds
+// flushLock.
+static void drain_dirty(void)
 {
-  uint currTicks;
-
-  acquire(&tickslock);
-  currTicks = ticks;
-  release(&tickslock);
-
-  if (cache_dirty_count() < SSIZE - 5 && currTicks - lastFlushTicks < NFLUSHTICKS){
-    return;
-  }
-
-  lastFlushTicks = currTicks;
-
-  acquiresleep(&flushLock);
-
-  // low on free segments: pick the best cleaning candidates and mark
-  // their still-live blocks dirty now, so the flush loop below --
-  // already about to run -- sweeps them out to a new segment in this
-  // same pass. 
-  int cleaningSegnums[GC_SEGMENTS_PER_ROUND];
-  int numCleaning = 0;
-  if (free_segment_count() < GC_MIN_FREE_SEGMENTS){
-    for (int round = 0; round < GC_SEGMENTS_PER_ROUND; round++){
-      int segnum = select_segment_to_clean();
-      if (segnum < 0){
-        break;  // nothing left worth cleaning
-      }
-      int alreadyCleaning = 0;
-      for (int k = 0; k < numCleaning; k++){
-        if (cleaningSegnums[k] == segnum){
-          alreadyCleaning = 1;
-          break;
-        }
-      }
-      if (alreadyCleaning){
-        // the best remaining candidate is one we already started
-        // cleaning this round (its sut entry won't reflect the
-        // migration until the flush below actually runs) -- nothing
-        // better to do this round.
-        break;
-      }
-      printf("gc: cleaning segment %d (live=%d)\n",
-             segnum, cp.sut[segnum].live_count);
-      clean_segment((uint) segnum);
-      cleaningSegnums[numCleaning++] = segnum;
-    }
-  }
-
   acquire(&cpLock);
   int offset = cp.fill_offset;
   release(&cpLock);
@@ -727,8 +722,8 @@ void maybe_flush_dirty()
       offset = 0;
 
       acquiresleep(&seg.lock);
-      // every 4 consecutive positions share one kalloc'd page as 
-      // seg.addrs[pageBase] holds that page's raw address. 
+      // every 4 consecutive positions share one kalloc'd page as
+      // seg.addrs[pageBase] holds that page's raw address.
       // Free each page exactly once before dropping the pointers
       for (int i=0; i<SSIZE; i+=4){
         if (seg.addrs[i] != 0){
@@ -759,25 +754,111 @@ void maybe_flush_dirty()
                        segment_start_block(cp.segment_num) + startOffset);
   }
 
-
   acquire(&cpLock);
   cp.fill_offset = offset;
   release(&cpLock);
+}
 
-  // the loop above just drained every dirty block, including whatever
-  // clean_segment() marked dirty -- if that fully migrated a cleaned
-  // segment's live blocks elsewhere, it's safe to hand it back out now.
-  for (int k = 0; k < numCleaning; k++){
+void maybe_flush_dirty()
+{
+  uint currTicks;
+
+  acquire(&tickslock);
+  currTicks = ticks;
+  release(&tickslock);
+
+  if (cache_dirty_count() < SSIZE - 5 && currTicks - lastFlushTicks < NFLUSHTICKS){
+    return;
+  }
+
+  lastFlushTicks = currTicks;
+
+  acquiresleep(&flushLock);
+
+  // low on free segments: clean segments into a batch sized to fit the
+  // current segment's remaining room, then drain once per batch --
+  // one contiguous write filling up the active segment, rather than a
+  // small write per segment cleaned. 
+  int gcRounds = 0;
+  while (free_segment_count() < GC_MIN_FREE_SEGMENTS && gcRounds < GC_SEGMENTS_PER_ROUND){
     acquire(&cpLock);
-    uint remaining = cp.sut[cleaningSegnums[k]].live_count;
+    int fillOffset = cp.fill_offset;
     release(&cpLock);
-    if (remaining == 0){
-      printf("gc: segment %d fully reclaimed\n", cleaningSegnums[k]);
-      free_segment((uint) cleaningSegnums[k]);
-    }else{
-      printf("gc: segment %d still has %d live blocks, retrying later\n",
-             cleaningSegnums[k], remaining);
+    uint remainingCapacity = (uint) group_capacity(fillOffset);
+
+    int batchSegnums[GC_SEGMENTS_PER_ROUND];
+    int batchCount = 0;
+    uint accumulatedLive = 0;
+
+    while (gcRounds < GC_SEGMENTS_PER_ROUND){
+      int segnum = select_segment_to_clean();
+      if (segnum < 0){
+        break;  // nothing left worth cleaning
+      }
+
+      int alreadyInBatch = 0;
+      for (int k = 0; k < batchCount; k++){
+        if (batchSegnums[k] == segnum){
+          alreadyInBatch = 1;
+          break;
+        }
+      }
+      if (alreadyInBatch){
+        break;  // nothing new left to add to this batch
+      }
+
+      acquire(&cpLock);
+      uint candidateLive = cp.sut[segnum].live_count;
+      release(&cpLock);
+
+      if (batchCount > 0 && accumulatedLive + candidateLive > remainingCapacity){
+        break;  // doesn't fit alongside what this batch already committed to
+      }
+
+      printf("gc: cleaning segment %d (live=%d)\n", segnum, candidateLive);
+      clean_segment((uint) segnum);
+      batchSegnums[batchCount++] = segnum;
+      accumulatedLive += candidateLive;
+      gcRounds++;
+
+      if (accumulatedLive >= remainingCapacity){
+        break;  // current segment's remaining room is spoken for
+      }
     }
+
+    if (batchCount == 0){
+      break;  // nothing left worth cleaning at all
+    }
+
+    drain_dirty();
+
+    for (int k = 0; k < batchCount; k++){
+      acquire(&cpLock);
+      uint remaining = cp.sut[batchSegnums[k]].live_count;
+      release(&cpLock);
+      if (remaining == 0){
+        printf("gc: segment %d fully reclaimed\n", batchSegnums[k]);
+        free_segment((uint) batchSegnums[k]);
+      }else{
+        printf("gc: segment %d still has %d live blocks, retrying later\n",
+               batchSegnums[k], remaining);
+      }
+    }
+  }
+
+  // drain whatever's left: the ordinary, non-GC-triggered case, or
+  // any leftover ambient dirty data after the loop above.
+  drain_dirty();
+
+  // checkpoint flush is cheap (NCHECKPOINTBLOCKS writes) but still is a
+  // non-sequential write to a fixed location -- so we do it after much
+  // longer intervals, not on every flush.
+  acquire(&tickslock);
+  uint nowTicks = ticks;
+  release(&tickslock);
+  if (nowTicks - lastCheckpointTicks >= CHECKPOINT_INTERVAL_TICKS){
+    lastCheckpointTicks = nowTicks;
+    checkpoint_flush();
   }
 
   releasesleep(&flushLock);

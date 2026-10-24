@@ -87,6 +87,8 @@ struct segsum_block {
 #define GC_SEGMENTS_PER_ROUND 5  // clean this many per triggered round, not just one --
                                   // otherwise a round's own ambient writes claim back
                                   // roughly what it just freed, net zero progress
+#define CHECKPOINT_INTERVAL_TICKS 300  // ~30s at 100ms/tick: persist far less often than
+                                        // every flush, since it's a non-sequential write
 
 struct sut_entry {
   uint live_count;
