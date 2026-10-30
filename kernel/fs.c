@@ -46,6 +46,7 @@ int nblocks;
 uint freeinode;
 
 void checkpointinit(int dev, struct lfs_superblock *sb, struct checkpoint *cp);
+void rollforward(void);
 static struct inode* iget(uint dev, uint inum);
 struct inode_cache_node* inode_get(uint dev, uint inum);
 struct indirect_cache_node *indirect_get(uint dev, uint inum);
@@ -70,13 +71,15 @@ void fsinit(int dev)
   if (sb.magic != FSMAGIC)
     panic("invalid file system");
 
+  nmeta = 1 + 1 + 2 * sb.checkpointsize;
+  nblocks = FSSIZE - nmeta;
+
   checkpointinit(dev, &sb, &cp);
   cacheinit();
   initsleeplock(&seg.lock, "segLock");
   initsleeplock(&flushLock, "flushLock");
 
-  nmeta = 1 + 1 + 2 * sb.checkpointsize;
-  nblocks = FSSIZE - nmeta;
+  rollforward();
 }
 
 void checkpointinit(int dev, struct lfs_superblock *sb, struct checkpoint *cp){
@@ -154,14 +157,21 @@ void checkpoint_flush(void)
 
 // SEGMENT WRITER
 
-uint checksum(void *data, int nbytes)
+// Folds nbytes of data into a running checksum state, so a checksum can
+// be computed over several non-contiguous chunks (e.g. blocks read one
+// at a time from disk) by carrying `sum` forward between calls.
+uint checksum_fold(uint sum, void *data, int nbytes)
 {
   uint *w = (uint*) data;
-  uint sum = 0;
   int nwords = nbytes / sizeof(uint);
   for(int i = 0; i < nwords; i++)
     sum = (sum << 1 | sum >> 31) ^ w[i];
   return sum;
+}
+
+uint checksum(void *data, int nbytes)
+{
+  return checksum_fold(0, data, nbytes);
 }
 
 uint segment_start_block(uint segnum)
@@ -387,6 +397,221 @@ void clean_segment(uint segnum)
     cp.sut[segnum].live_count = foundLive;
   }
   release(&cpLock);
+}
+
+// CRASH RECOVERY (ROLL-FORWARD)
+
+// self_checksum alone only proves the summary block itself wasn't torn.
+// It says nothing about the data blocks a group describes -- a crash
+// can leave the summary intact while the blocks after it are missing,
+// stale, or partially written. This re-reads those `count` blocks fresh
+// from disk and folds them into a checksum the same way build_group()
+// did at write time, so a torn data write is caught even when the
+// summary that describes it landed cleanly.
+static int validate_group_data(struct segsum_block *ssb, uint base, uint pos, int count)
+{
+  uint sum = 0;
+  for (int i = 0; i < count; i++){
+    struct buf *b = bread(ROOTDEV, base + pos + 1 + i);
+    sum = checksum_fold(sum, b->data, BSIZE);
+    brelse(b);
+  }
+  return sum == ssb->data_checksum;
+}
+
+// Our goal for Rollforward is too find the latest version of every imap  
+// block, across all valid groups in all candidate segments, since through
+// imap blocks, you can find valid address of every child block.
+// For this, we start looping through segments in a descending order 
+// of their `seq`. While walking forward in the current segment, we
+// keep track of the latest version of every imap block that we come accross.
+// Then for every imap found, we check if we have ever found the same imap
+// block in one of the previous segments that we walked by refering the global
+// tracker, and if so, then we ignore it, as the one found in previous segment
+// will be the latest version. If we did not find it previously, then we mark
+// its location in the global tracker. 
+//
+// Returns the offset scanning stopped at.
+static uint rollforward_segment(uint segnum, uint *segLatest)
+{
+  uint base = segment_start_block(segnum);
+  uint pos = 0;
+
+  for (int i = 0; i < IMAP_BLK_NUM; i++){
+    segLatest[i] = 0;
+  }
+
+  while (pos < SSIZE){
+    struct buf *b = bread(ROOTDEV, base + pos);
+    struct segsum_block *ssb = (struct segsum_block*) b->data;
+
+    if (checksum(ssb, sizeof(*ssb) - sizeof(uint)) != ssb->self_checksum){
+      brelse(b);
+      break;
+    }
+
+    int count = 0;
+    while (count < NDATA_PER_SEGSUM - 1 &&
+           !(ssb->entries[count].tag1 == 0 && ssb->entries[count].tag2 == 0)){
+      count++;
+    }
+
+    if (!validate_group_data(ssb, base, pos, count)){
+      brelse(b);
+      break;  // summary landed intact but its data didn't
+    }
+
+    for (int i = 0; i < count; i++){
+      if (ssb->entries[i].tag1 == 0){
+        // imap block, idx = tag2-1
+        uint idx = ssb->entries[i].tag2 - 1;
+        segLatest[idx] = base + pos + 1 + i;
+      }
+    }
+
+    brelse(b);
+    pos += 1 + count;
+  }
+
+  return pos;
+}
+
+// Replays everything written to disk since the loaded checkpoint, so a
+// crash between checkpoints doesn't lose committed writes. A segment is
+// a candidate if its seq is newer than the checkpoint's global_seq, or
+// it's the checkpoint's own active segment -- the active segment keeps
+// the same seq across every flush it absorbs, so more groups can have
+// been appended to it after the checkpoint snapshot without its seq
+// ever exceeding the loaded one.
+//
+// Candidates are visited newest-seq-first. Each one's own forward walk
+// (see rollforward_segment()) hands back the latest imap tag it found
+// per idx; those are merged into cp.imap_addr[] only for idx's not
+// already resolved by a newer candidate, so the most recent write to
+// any given imap range wins and everything older is silently superseded.
+void rollforward(void)
+{
+  uint loadedSeq = cp.global_seq;
+  uint loadedActiveSeg = cp.segment_num;
+
+  // segSeq[s] holds segment s's seq if it's a candidate, indexed
+  // directly by segment number.
+  static uint segSeq[SEG_NUM];
+  for (int s = 0; s < SEG_NUM; s++){
+    segSeq[s] = 0;
+  }
+
+  int nCandidates = 0;
+  uint maxSeq = loadedSeq;
+  int maxSeqSegnum = -1;
+
+  for (uint s = 0; s < SEG_NUM; s++){
+    uint base = segment_start_block(s);
+    struct buf *b = bread(ROOTDEV, base);
+    struct segsum_block *ssb = (struct segsum_block*) b->data;
+
+    int valid = checksum(ssb, sizeof(*ssb) - sizeof(uint)) == ssb->self_checksum;
+    uint seq = ssb->seq;
+    brelse(b);
+
+    if (!valid){
+      continue;  // never written, or torn right at its first block
+    }
+    if (seq <= loadedSeq && s != loadedActiveSeg){
+      continue;  // already fully reflected in the loaded checkpoint
+    }
+
+    segSeq[s] = seq;
+    nCandidates++;
+    if (seq >= maxSeq){
+      maxSeq = seq;
+      maxSeqSegnum = (int) s;
+    }
+  }
+
+  if (nCandidates == 0){
+    return;  // checkpoint already reflects everything durable on disk
+  }
+
+  printf("recovering: replaying %d segment(s) written since last checkpoint\n", nCandidates);
+
+  cp.global_seq = maxSeq;
+
+  // visit candidates newest-seq-first; order[] holds segment numbers
+  // directly, so the replay loop below needs no further lookup.
+  static int order[SEG_NUM];
+  {
+    static int picked[SEG_NUM];
+    for (int s = 0; s < SEG_NUM; s++){
+      picked[s] = 0;
+    }
+    for (int done = 0; done < nCandidates; done++){
+      int pickSeg = -1;
+      for (int s = 0; s < SEG_NUM; s++){
+        if (segSeq[s] == 0 || picked[s]){
+          continue;
+        }
+        if (pickSeg == -1 || segSeq[s] > segSeq[pickSeg]){
+          pickSeg = s;
+        }
+      }
+      order[done] = pickSeg;
+      picked[pickSeg] = 1;
+    }
+  }
+
+  static int resolved[IMAP_BLK_NUM];
+  static uint segLatest[IMAP_BLK_NUM];
+  for (int i = 0; i < IMAP_BLK_NUM; i++){
+    resolved[i] = 0;
+  }
+  uint stoppedAt = 0;
+
+  for (int k = 0; k < nCandidates; k++){
+    uint segnum = order[k];
+
+    uint s = rollforward_segment(segnum, segLatest);
+    claim_segment(segnum);
+    if ((int) segnum == maxSeqSegnum){
+      stoppedAt = s;
+    }
+
+    for (int i = 0; i < IMAP_BLK_NUM; i++){
+      if (segLatest[i] != 0 && !resolved[i]){
+        cp.imap_addr[i] = segLatest[i];
+        resolved[i] = 1;
+      }
+    }
+  }
+
+  cp.segment_num = maxSeqSegnum;
+  cp.fill_offset = (int) stoppedAt;
+
+  // the highest inum any resolved imap range actually hands out, so
+  // freeinode can't later re-allocate a number this replay just
+  // brought back into use.
+  uint maxInum = 0;
+  for (int i = 0; i < IMAP_BLK_NUM; i++){
+    if (!resolved[i]){
+      continue;
+    }
+    struct buf *b = bread(ROOTDEV, cp.imap_addr[i]);
+    uint *addrs = (uint*) b->data;
+    for (int off = 0; off < IMAP_ENTRIES_PER_BLK; off++){
+      if (addrs[off] != 0){
+        uint inum = i * IMAP_ENTRIES_PER_BLK + off + 1;
+        if (inum > maxInum){
+          maxInum = inum;
+        }
+      }
+    }
+    brelse(b);
+  }
+  if (maxInum + 1 > freeinode){
+    freeinode = maxInum + 1;
+  }
+
+  checkpoint_flush();
 }
 
 // how many more real (non-summary) blocks the in-progress group could
